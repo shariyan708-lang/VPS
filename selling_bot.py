@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import sqlite3
@@ -242,6 +243,8 @@ class Store:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA temp_store=MEMORY")
             self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA cache_size=-20000")
+            self.conn.execute("PRAGMA mmap_size=268435456")
         self.init_schema()
         self.init_migrations()
         self.init_indexes()
@@ -1463,10 +1466,18 @@ class TelegramAPI:
         self.token = token.strip()
         self.base = f"https://api.telegram.org/bot{self.token}/" if self.token else ""
         self.opener = urllib.request.build_opener()
+        self.api_timeout = int(os.getenv("TG_API_TIMEOUT_SECONDS", "12"))
+        self.get_updates_timeout = int(os.getenv("TG_GET_UPDATES_TIMEOUT_SECONDS", "20"))
+        self.send_timeout = int(os.getenv("TG_SEND_TIMEOUT_SECONDS", "12"))
+        self.edit_timeout = int(os.getenv("TG_EDIT_TIMEOUT_SECONDS", "10"))
+        self.copy_timeout = int(os.getenv("TG_COPY_TIMEOUT_SECONDS", "15"))
+        self.member_timeout = int(os.getenv("TG_MEMBER_TIMEOUT_SECONDS", "8"))
+        self.document_timeout = int(os.getenv("TG_DOCUMENT_TIMEOUT_SECONDS", "30"))
 
-    def request(self, method: str, payload: dict[str, Any] | None = None, timeout: int = 35) -> dict[str, Any]:
+    def request(self, method: str, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
         if not self.token:
             return {"ok": False, "description": "BOT_TOKEN is missing"}
+        timeout = self.api_timeout if timeout is None else timeout
         data = json.dumps(payload or {}, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             self.base + method,
@@ -1482,7 +1493,8 @@ class TelegramAPI:
         except Exception as exc:
             return {"ok": False, "description": str(exc)}
 
-    def get_updates(self, offset: int, timeout: int = 25) -> dict[str, Any]:
+    def get_updates(self, offset: int, timeout: int | None = None) -> dict[str, Any]:
+        timeout = self.get_updates_timeout if timeout is None else timeout
         return self.request(
             "getUpdates",
             {
@@ -1490,7 +1502,7 @@ class TelegramAPI:
                 "timeout": timeout,
                 "allowed_updates": ["message", "callback_query"],
             },
-            timeout + 10,
+            timeout + 5,
         )
 
     def send_message(
@@ -1512,7 +1524,7 @@ class TelegramAPI:
                 payload["reply_markup"] = reply_markup
             if parse_mode:
                 payload["parse_mode"] = parse_mode
-            last = self.request("sendMessage", payload)
+            last = self.request("sendMessage", payload, timeout=self.send_timeout)
         return last
 
     def send_document(
@@ -1554,7 +1566,7 @@ class TelegramAPI:
             method="POST",
         )
         try:
-            with self.opener.open(req, timeout=60) as resp:
+            with self.opener.open(req, timeout=self.document_timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             return {"ok": False, "description": exc.read().decode("utf-8", "replace")}
@@ -1579,22 +1591,24 @@ class TelegramAPI:
             payload["reply_markup"] = reply_markup
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        return self.request("editMessageText", payload)
+        return self.request("editMessageText", payload, timeout=self.edit_timeout)
 
     def answer_callback(self, callback_id: str, text: str = "", alert: bool = False) -> dict[str, Any]:
         return self.request(
             "answerCallbackQuery",
             {"callback_query_id": callback_id, "text": text[:180], "show_alert": alert},
+            timeout=5,
         )
 
     def copy_message(self, chat_id: int, from_chat_id: int, message_id: int) -> dict[str, Any]:
         return self.request(
             "copyMessage",
             {"chat_id": chat_id, "from_chat_id": from_chat_id, "message_id": message_id},
+            timeout=self.copy_timeout,
         )
 
     def get_chat_member(self, chat_id: str, user_id: int) -> dict[str, Any]:
-        return self.request("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+        return self.request("getChatMember", {"chat_id": chat_id, "user_id": user_id}, timeout=self.member_timeout)
 
 
 class BotApp:
@@ -1604,8 +1618,14 @@ class BotApp:
         self.admins = admins
         self.stop_event = threading.Event()
         self.join_cache_seconds = int(os.getenv("JOIN_CACHE_SECONDS", "300"))
+        self.failed_join_cache_seconds = int(os.getenv("FAILED_JOIN_CACHE_SECONDS", "20"))
         self.join_success_cache: dict[int, float] = {}
+        self.join_failure_cache: dict[int, tuple[float, list[str]]] = {}
         self.broadcast_delay = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.035"))
+        self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "4")))
+        self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "100")))
+        self.slow_update_seconds = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "3"))
+        self.polling_error_sleep = float(os.getenv("POLLING_ERROR_SLEEP_SECONDS", "2"))
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
@@ -1672,20 +1692,42 @@ class BotApp:
     def run(self) -> None:
         if not self.api.token:
             raise RuntimeError("BOT_TOKEN is required")
-        print("Telegram selling bot started.")
+        print(f"Telegram selling bot started. workers={self.update_workers}", flush=True)
         offset = 0
-        while not self.stop_event.is_set():
-            response = self.api.get_updates(offset)
-            if not response.get("ok"):
-                print("Polling error:", response.get("description"))
-                time.sleep(5)
-                continue
-            for update in response.get("result", []):
-                offset = max(offset, int(update["update_id"]) + 1)
-                try:
-                    self.handle_update(update)
-                except Exception:
-                    traceback.print_exc()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.update_workers,
+            thread_name_prefix="bot-update",
+        ) as executor:
+            pending: set[concurrent.futures.Future[Any]] = set()
+            while not self.stop_event.is_set():
+                response = self.api.get_updates(offset)
+                if not response.get("ok"):
+                    print("Polling error:", response.get("description"), flush=True)
+                    time.sleep(self.polling_error_sleep)
+                    continue
+                for update in response.get("result", []):
+                    offset = max(offset, int(update["update_id"]) + 1)
+                    pending = {future for future in pending if not future.done()}
+                    while len(pending) >= self.max_pending_updates:
+                        _, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=1,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                    pending.add(executor.submit(self.handle_update_safely, update))
+
+    def handle_update_safely(self, update: dict[str, Any]) -> None:
+        started = time.monotonic()
+        try:
+            self.handle_update(update)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= self.slow_update_seconds:
+                update_id = update.get("update_id", "-")
+                keys = ",".join(key for key in ("message", "callback_query") if key in update) or "unknown"
+                print(f"Slow update {update_id} ({keys}) took {elapsed:.2f}s", flush=True)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -1921,6 +1963,9 @@ class BotApp:
         cached_until = self.join_success_cache.get(user_id, 0)
         if use_cache and cached_until > time.monotonic():
             return True, []
+        failed = self.join_failure_cache.get(user_id)
+        if use_cache and failed and failed[0] > time.monotonic():
+            return False, list(failed[1])
         channels = self.store.channels(enabled_only=True)
         if not channels:
             return True, []
@@ -1949,8 +1994,10 @@ class BotApp:
                 missing.append(title)
         if missing:
             self.join_success_cache.pop(user_id, None)
+            self.join_failure_cache[user_id] = (time.monotonic() + self.failed_join_cache_seconds, list(missing))
             return False, missing
         self.join_success_cache[user_id] = time.monotonic() + self.join_cache_seconds
+        self.join_failure_cache.pop(user_id, None)
         return True, []
 
     def join_ok(self, user_id: int) -> bool:

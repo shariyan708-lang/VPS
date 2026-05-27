@@ -16,7 +16,17 @@ echo "==> Installing Python dependencies"
 if [ ! -f .env ]; then
   echo "==> Creating .env from .env.example"
   cp .env.example .env
-  echo "Edit .env before starting the bot: nano .env"
+  echo "Edit .env before continuing:"
+  echo "nano .env"
+  echo "Then run this script again."
+  exit 0
+fi
+
+if grep -Eq 'replace_with_your_bot_token|your_bot_username|your_numeric_telegram_user_id|user:password@host' .env; then
+  echo "Your .env still contains placeholder values."
+  echo "Edit it first:"
+  echo "nano .env"
+  exit 1
 fi
 
 echo "==> Initializing database schema"

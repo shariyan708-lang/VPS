@@ -20,6 +20,8 @@ Normal Telegram bot for selling license keys/products. This is not a website and
 - SQLite fallback for local testing
 - PostgreSQL reconnect/keepalive, cached settings, cached join checks and optimized indexes
 - Concurrent update workers and shorter Telegram API timeouts to prevent one slow request from freezing the bot
+- Duplicate click protection for busy users tapping the same button many times
+- Background broadcast/maintenance notifications so admin panel stays responsive
 - VPS systemd scripts for 24/7 hosting
 
 ## Files
@@ -100,23 +102,28 @@ DB_PATH=data/telegram_selling_bot.sqlite3
 JOIN_CACHE_SECONDS=300
 FAILED_JOIN_CACHE_SECONDS=20
 SETTINGS_CACHE_SECONDS=5
-UPDATE_WORKERS=4
-MAX_PENDING_UPDATES=100
+DB_SLOW_LOG_SECONDS=1.5
+USER_TOUCH_SECONDS=60
+UPDATE_WORKERS=8
+MAX_PENDING_UPDATES=500
+BACKGROUND_WORKERS=2
+ACTION_DEBOUNCE_SECONDS=1.2
+ADMIN_ACTION_DEBOUNCE_SECONDS=0.7
 SLOW_UPDATE_LOG_SECONDS=3
 POLLING_ERROR_SLEEP_SECONDS=2
-TG_API_TIMEOUT_SECONDS=12
+TG_API_TIMEOUT_SECONDS=8
 TG_GET_UPDATES_TIMEOUT_SECONDS=20
-TG_SEND_TIMEOUT_SECONDS=12
-TG_EDIT_TIMEOUT_SECONDS=10
-TG_COPY_TIMEOUT_SECONDS=15
-TG_MEMBER_TIMEOUT_SECONDS=8
-TG_DOCUMENT_TIMEOUT_SECONDS=30
+TG_SEND_TIMEOUT_SECONDS=8
+TG_EDIT_TIMEOUT_SECONDS=6
+TG_COPY_TIMEOUT_SECONDS=10
+TG_MEMBER_TIMEOUT_SECONDS=5
+TG_DOCUMENT_TIMEOUT_SECONDS=25
 PG_CONNECT_TIMEOUT=10
 PG_KEEPALIVES_IDLE=30
 PG_KEEPALIVES_INTERVAL=10
 PG_KEEPALIVES_COUNT=5
 PG_RECONNECT_LOG_SECONDS=60
-BROADCAST_DELAY_SECONDS=0.035
+BROADCAST_DELAY_SECONDS=0.025
 ```
 
 Leave `DATABASE_URL=` empty for local VPS SQLite database. Use PostgreSQL/Neon URL only if you want an external PostgreSQL database.

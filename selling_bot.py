@@ -215,11 +215,14 @@ class Store:
         self.database_url = database_url.strip()
         self.is_pg = self.database_url.startswith(("postgres://", "postgresql://"))
         self.settings_cache_seconds = float_env("SETTINGS_CACHE_SECONDS", 5)
+        self.db_slow_log_seconds = float_env("DB_SLOW_LOG_SECONDS", 1.5)
+        self.user_touch_seconds = float_env("USER_TOUCH_SECONDS", 60)
         self.pg_reconnect_log_seconds = float_env("PG_RECONNECT_LOG_SECONDS", 60)
         self._last_pg_reconnect_log = 0.0
         self._settings_cache: dict[str, str] | None = None
         self._settings_cache_until = 0.0
         self._channels_cache: dict[bool, tuple[float, list[Any]]] = {}
+        self._user_touch_cache: dict[int, float] = {}
         self.psycopg = None
         self.pg_dict_row = None
         if self.is_pg:
@@ -323,6 +326,7 @@ class Store:
         one: bool = False,
         all_rows: bool = False,
     ) -> Any:
+        started = time.monotonic()
         with self.lock:
             def run() -> Any:
                 cur = self.conn.execute(self.q(sql), params)
@@ -335,11 +339,14 @@ class Store:
                     self.conn.commit()
                 return result if (one or all_rows) else cur
 
-            return self.retry_pg_once(run) if self.is_pg else run()
+            result = self.retry_pg_once(run) if self.is_pg else run()
+        self.log_slow_db(sql, started)
+        return result
 
     def execute_many(self, sql: str, rows: list[tuple[Any, ...]]) -> int:
         if not rows:
             return 0
+        started = time.monotonic()
         with self.lock:
             def run() -> int:
                 self.begin()
@@ -353,7 +360,21 @@ class Store:
                     self.rollback()
                     raise
 
-            return self.retry_pg_once(run) if self.is_pg else run()
+            result = self.retry_pg_once(run) if self.is_pg else run()
+        self.log_slow_db(sql, started, rows=len(rows))
+        return result
+
+    def log_slow_db(self, sql: str, started: float, *, rows: int | None = None) -> None:
+        if self.db_slow_log_seconds <= 0:
+            return
+        elapsed = time.monotonic() - started
+        if elapsed < self.db_slow_log_seconds:
+            return
+        summary = " ".join(sql.strip().split())
+        if len(summary) > 140:
+            summary = summary[:137] + "..."
+        extra = f" rows={rows}" if rows is not None else ""
+        print(f"Slow DB query took {elapsed:.2f}s{extra}: {summary}", flush=True)
 
     def begin(self) -> None:
         try:
@@ -794,56 +815,65 @@ class Store:
         first_name = tg_user.get("first_name") or ""
         last_name = tg_user.get("last_name") or ""
         clean_referrer = referrer_id if referrer_id and referrer_id != user_id else None
+        existing = self.user(user_id)
+        if existing:
+            now = time.monotonic()
+            touch_until = self._user_touch_cache.get(user_id, 0.0)
+            profile_changed = (
+                str(existing["username"] or "") != username
+                or str(existing["first_name"] or "") != first_name
+                or str(existing["last_name"] or "") != last_name
+            )
+            if profile_changed or now >= touch_until:
+                self.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, first_name = ?, last_name = ?, updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (username, first_name, last_name, stamp, user_id),
+                )
+                self._user_touch_cache[user_id] = now + self.user_touch_seconds
+            return existing
+
+        started = time.monotonic()
         with self.lock:
             self.begin()
             try:
-                existing = self.conn.execute(
-                    self.q("SELECT user_id FROM users WHERE user_id = ?"),
-                    (user_id,),
-                ).fetchone()
-                if existing:
+                self.conn.execute(
+                    self.q(
+                        """
+                        INSERT INTO users(user_id, username, first_name, last_name, referred_by, created_at, updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (user_id, username, first_name, last_name, clean_referrer, stamp, stamp),
+                )
+                if clean_referrer and referral_reward_cents > 0:
                     self.conn.execute(
                         self.q(
-                            """
-                            UPDATE users
-                            SET username = ?, first_name = ?, last_name = ?, updated_at = ?
-                            WHERE user_id = ?
-                            """
+                            "UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?"
                         ),
-                        (username, first_name, last_name, stamp, user_id),
+                        (referral_reward_cents, stamp, clean_referrer),
                     )
-                else:
                     self.conn.execute(
                         self.q(
-                            """
-                            INSERT INTO users(user_id, username, first_name, last_name, referred_by, created_at, updated_at)
-                            VALUES(?, ?, ?, ?, ?, ?, ?)
-                            """
+                            "INSERT INTO audit_logs(actor, action, details, created_at) VALUES(?, ?, ?, ?)"
                         ),
-                        (user_id, username, first_name, last_name, clean_referrer, stamp, stamp),
+                        (
+                            "system",
+                            "referral_reward",
+                            f"referrer={clean_referrer}; new_user={user_id}; amount_cents={referral_reward_cents}",
+                            stamp,
+                        ),
                     )
-                    if clean_referrer and referral_reward_cents > 0:
-                        self.conn.execute(
-                            self.q(
-                                "UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?"
-                            ),
-                            (referral_reward_cents, stamp, clean_referrer),
-                        )
-                        self.conn.execute(
-                            self.q(
-                                "INSERT INTO audit_logs(actor, action, details, created_at) VALUES(?, ?, ?, ?)"
-                            ),
-                            (
-                                "system",
-                                "referral_reward",
-                                f"referrer={clean_referrer}; new_user={user_id}; amount_cents={referral_reward_cents}",
-                                stamp,
-                            ),
-                        )
                 self.commit()
             except Exception:
                 self.rollback()
                 raise
+            finally:
+                self.log_slow_db("upsert_user transaction", started)
+        self._user_touch_cache[user_id] = time.monotonic() + self.user_touch_seconds
         return self.user(user_id)
 
     def user(self, user_id: int) -> Any:
@@ -1139,6 +1169,7 @@ class Store:
     def purchase(self, user_id: int, variant_id: int, quantity: int = 1) -> dict[str, Any]:
         stamp = now_iso()
         quantity = max(1, min(int(quantity or 1), 50))
+        started = time.monotonic()
         with self.lock:
             self.begin()
             try:
@@ -1263,6 +1294,8 @@ class Store:
             except Exception:
                 self.rollback()
                 raise
+            finally:
+                self.log_slow_db("purchase transaction", started)
 
     def create_topup(self, user_id: int, amount_cents: int, method: str, txn_ref: str) -> int:
         stamp = now_iso()
@@ -1362,6 +1395,7 @@ class Store:
     def claim_redeem_code(self, user_id: int, code: str) -> dict[str, Any]:
         clean_code = code.strip().upper()
         stamp = now_iso()
+        started = time.monotonic()
         with self.lock:
             self.begin()
             try:
@@ -1409,6 +1443,8 @@ class Store:
             except Exception:
                 self.rollback()
                 raise
+            finally:
+                self.log_slow_db("redeem claim transaction", started)
 
     def orders(self, limit: int = 15, user_id: int | None = None) -> list[Any]:
         where = ""
@@ -1466,13 +1502,13 @@ class TelegramAPI:
         self.token = token.strip()
         self.base = f"https://api.telegram.org/bot{self.token}/" if self.token else ""
         self.opener = urllib.request.build_opener()
-        self.api_timeout = int(os.getenv("TG_API_TIMEOUT_SECONDS", "12"))
+        self.api_timeout = int(os.getenv("TG_API_TIMEOUT_SECONDS", "8"))
         self.get_updates_timeout = int(os.getenv("TG_GET_UPDATES_TIMEOUT_SECONDS", "20"))
-        self.send_timeout = int(os.getenv("TG_SEND_TIMEOUT_SECONDS", "12"))
-        self.edit_timeout = int(os.getenv("TG_EDIT_TIMEOUT_SECONDS", "10"))
-        self.copy_timeout = int(os.getenv("TG_COPY_TIMEOUT_SECONDS", "15"))
-        self.member_timeout = int(os.getenv("TG_MEMBER_TIMEOUT_SECONDS", "8"))
-        self.document_timeout = int(os.getenv("TG_DOCUMENT_TIMEOUT_SECONDS", "30"))
+        self.send_timeout = int(os.getenv("TG_SEND_TIMEOUT_SECONDS", "8"))
+        self.edit_timeout = int(os.getenv("TG_EDIT_TIMEOUT_SECONDS", "6"))
+        self.copy_timeout = int(os.getenv("TG_COPY_TIMEOUT_SECONDS", "10"))
+        self.member_timeout = int(os.getenv("TG_MEMBER_TIMEOUT_SECONDS", "5"))
+        self.document_timeout = int(os.getenv("TG_DOCUMENT_TIMEOUT_SECONDS", "25"))
 
     def request(self, method: str, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
         if not self.token:
@@ -1485,13 +1521,25 @@ class TelegramAPI:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with self.opener.open(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            return {"ok": False, "description": exc.read().decode("utf-8", "replace")}
-        except Exception as exc:
-            return {"ok": False, "description": str(exc)}
+        for attempt in range(2):
+            try:
+                with self.opener.open(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")
+                if exc.code == 429 and attempt == 0:
+                    retry_after = 1
+                    try:
+                        parsed = json.loads(body)
+                        retry_after = int(parsed.get("parameters", {}).get("retry_after", retry_after))
+                    except Exception:
+                        pass
+                    time.sleep(max(1, min(retry_after, 5)))
+                    continue
+                return {"ok": False, "description": body}
+            except Exception as exc:
+                return {"ok": False, "description": str(exc)}
+        return {"ok": False, "description": "request failed"}
 
     def get_updates(self, offset: int, timeout: int | None = None) -> dict[str, Any]:
         timeout = self.get_updates_timeout if timeout is None else timeout
@@ -1621,11 +1669,22 @@ class BotApp:
         self.failed_join_cache_seconds = int(os.getenv("FAILED_JOIN_CACHE_SECONDS", "20"))
         self.join_success_cache: dict[int, float] = {}
         self.join_failure_cache: dict[int, tuple[float, list[str]]] = {}
-        self.broadcast_delay = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.035"))
-        self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "4")))
-        self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "100")))
+        self.broadcast_delay = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.025"))
+        self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "8")))
+        self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "500")))
+        self.background_workers = max(1, int(os.getenv("BACKGROUND_WORKERS", "2")))
+        self.action_debounce_seconds = float(os.getenv("ACTION_DEBOUNCE_SECONDS", "1.2"))
+        self.admin_action_debounce_seconds = float(os.getenv("ADMIN_ACTION_DEBOUNCE_SECONDS", "0.7"))
         self.slow_update_seconds = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "3"))
         self.polling_error_sleep = float(os.getenv("POLLING_ERROR_SLEEP_SECONDS", "2"))
+        self._recent_action_lock = threading.Lock()
+        self._recent_actions: dict[tuple[int, str], float] = {}
+        self._user_locks_guard = threading.Lock()
+        self._user_locks: dict[int, threading.Lock] = {}
+        self.background_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.background_workers,
+            thread_name_prefix="bot-bg",
+        )
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
@@ -1692,7 +1751,10 @@ class BotApp:
     def run(self) -> None:
         if not self.api.token:
             raise RuntimeError("BOT_TOKEN is required")
-        print(f"Telegram selling bot started. workers={self.update_workers}", flush=True)
+        print(
+            f"Telegram selling bot started. workers={self.update_workers} bg_workers={self.background_workers}",
+            flush=True,
+        )
         offset = 0
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.update_workers,
@@ -1719,7 +1781,12 @@ class BotApp:
     def handle_update_safely(self, update: dict[str, Any]) -> None:
         started = time.monotonic()
         try:
-            self.handle_update(update)
+            user_id = self.update_user_id(update)
+            if user_id is None:
+                self.handle_update(update)
+            else:
+                with self.user_lock(user_id):
+                    self.handle_update(update)
         except Exception:
             traceback.print_exc()
         finally:
@@ -1728,6 +1795,82 @@ class BotApp:
                 update_id = update.get("update_id", "-")
                 keys = ",".join(key for key in ("message", "callback_query") if key in update) or "unknown"
                 print(f"Slow update {update_id} ({keys}) took {elapsed:.2f}s", flush=True)
+
+    def update_user_id(self, update: dict[str, Any]) -> int | None:
+        try:
+            if "message" in update and "from" in update["message"]:
+                return int(update["message"]["from"]["id"])
+            if "callback_query" in update and "from" in update["callback_query"]:
+                return int(update["callback_query"]["from"]["id"])
+        except Exception:
+            return None
+        return None
+
+    def user_lock(self, user_id: int) -> threading.Lock:
+        with self._user_locks_guard:
+            lock = self._user_locks.get(user_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._user_locks[user_id] = lock
+            return lock
+
+    def should_debounce_action(self, user_id: int, action: str, admin: bool = False) -> bool:
+        seconds = self.admin_action_debounce_seconds if admin else self.action_debounce_seconds
+        if seconds <= 0 or not action:
+            return False
+        now = time.monotonic()
+        key = (user_id, action)
+        with self._recent_action_lock:
+            last = self._recent_actions.get(key, 0)
+            if now - last < seconds:
+                return True
+            self._recent_actions[key] = now
+            if len(self._recent_actions) > 20000:
+                cutoff = now - max(seconds * 4, 10)
+                self._recent_actions = {
+                    old_key: old_time
+                    for old_key, old_time in self._recent_actions.items()
+                    if old_time >= cutoff
+                }
+            return False
+
+    def message_action_key(self, text: str) -> str:
+        button = text.strip().lower()
+        command = button.split(maxsplit=1)[0] if button else ""
+        if command in {
+            "/start",
+            "/menu",
+            "/shop",
+            "/balance",
+            "/invite",
+            "/profile",
+            "/info",
+            "/topup",
+            "/orders",
+            "/help",
+            "/contact",
+            "/admin",
+        }:
+            return f"cmd:{command}"
+        for label in ("buy key", "invite friends", "profile", "info bot", "redeem", "admin panel", "admin"):
+            if label in button:
+                return f"btn:{label}"
+        return ""
+
+    def start_background_task(self, name: str, fn: Any, *args: Any) -> None:
+        def runner() -> None:
+            started = time.monotonic()
+            try:
+                fn(*args)
+            except Exception:
+                print(f"Background task failed: {name}", flush=True)
+                traceback.print_exc()
+            finally:
+                elapsed = time.monotonic() - started
+                if elapsed >= self.slow_update_seconds:
+                    print(f"Background task {name} took {elapsed:.2f}s", flush=True)
+
+        self.background_executor.submit(runner)
 
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -1742,6 +1885,12 @@ class BotApp:
         user_id = int(tg_user["id"])
         chat_id = int(msg["chat"]["id"])
         text = (msg.get("text") or "").strip()
+        action_key = self.message_action_key(text)
+        debounced_before_db = False
+        if action_key and not self.is_admin(user_id):
+            if self.should_debounce_action(user_id, action_key, admin=False):
+                return
+            debounced_before_db = True
         user = self.store.upsert_user(
             tg_user,
             referrer_id=self.start_referrer(text),
@@ -1782,6 +1931,12 @@ class BotApp:
             return
 
         command = text.split(maxsplit=1)[0].lower() if text else ""
+        if action_key and not debounced_before_db and self.should_debounce_action(
+            user_id,
+            action_key,
+            admin=self.is_admin(user_id),
+        ):
+            return
         if command in {"/start", "/menu"} and self.should_show_join_gate_first(user_id):
             self.show_join_gate(chat_id)
             return
@@ -1831,18 +1986,22 @@ class BotApp:
         chat_id = int(query["message"]["chat"]["id"])
         message_id = int(query["message"]["message_id"])
         data = query.get("data") or ""
+        is_admin_user = self.is_admin(user_id)
+        if self.should_debounce_action(user_id, f"cb:{data}", admin=is_admin_user):
+            self.api.answer_callback(query["id"], "Please wait...", alert=False)
+            return
         user = self.store.upsert_user(query["from"])
         if data not in {"verify", "u:stockout"} and not data.startswith("u:qcustom:"):
             self.api.answer_callback(query["id"])
 
         if data.startswith("adm:") or data.startswith("ap:") or data.startswith("av:") or data.startswith("au:") or data.startswith("at:"):
-            if not self.is_admin(user_id):
+            if not is_admin_user:
                 self.api.answer_callback(query["id"], "Admin only.", alert=True)
                 return
             self.handle_admin_callback(chat_id, message_id, user_id, data)
             return
 
-        if self.is_admin(user_id):
+        if is_admin_user:
             self.api.answer_callback(query["id"], "Admin account uses admin panel only.", alert=True)
             self.show_admin_home(chat_id)
             return
@@ -3351,18 +3510,9 @@ class BotApp:
                 self.api.send_message(chat_id, "Message sent." if result.get("ok") else f"Failed: {result.get('description')}", self.admin_keyboard())
 
             elif state == "broadcast":
-                sent = 0
-                failed = 0
-                for user_id in self.store.all_user_ids():
-                    result = self.api.copy_message(user_id, chat_id, int(msg["message_id"]))
-                    if result.get("ok"):
-                        sent += 1
-                    else:
-                        failed += 1
-                    if self.broadcast_delay > 0:
-                        time.sleep(self.broadcast_delay)
                 self.store.clear_state(admin_id)
-                self.api.send_message(chat_id, f"Broadcast finished.\nSent: {sent}\nFailed: {failed}", self.admin_keyboard())
+                self.api.send_message(chat_id, "Broadcast started in background. You can keep using the admin panel.", self.admin_keyboard())
+                self.start_background_task("broadcast", self.broadcast_copy_task, admin_id, chat_id, int(msg["message_id"]))
 
             elif state in {"addbal", "deduct"}:
                 amount = parse_cents(text, 0)
@@ -3421,7 +3571,27 @@ class BotApp:
         for admin_id in self.admins:
             self.api.send_message(admin_id, text, reply_markup)
 
+    def broadcast_copy_task(self, admin_id: int, from_chat_id: int, message_id: int) -> None:
+        sent = 0
+        failed = 0
+        for user_id in self.store.all_user_ids():
+            result = self.api.copy_message(user_id, from_chat_id, message_id)
+            if result.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+            if self.broadcast_delay > 0:
+                time.sleep(self.broadcast_delay)
+        self.api.send_message(
+            admin_id,
+            f"Broadcast finished.\nSent: {sent}\nFailed: {failed}",
+            self.admin_keyboard(),
+        )
+
     def notify_users(self, text: str) -> None:
+        self.start_background_task("notify_users", self.notify_users_task, text)
+
+    def notify_users_task(self, text: str) -> None:
         for user_id in self.store.all_user_ids():
             if user_id in self.admins:
                 continue

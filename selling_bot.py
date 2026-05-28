@@ -1554,14 +1554,22 @@ class TelegramAPI:
     def __init__(self, token: str):
         self.token = token.strip()
         self.base = f"https://api.telegram.org/bot{self.token}/" if self.token else ""
-        self.opener = urllib.request.build_opener()
+        self._local = threading.local()
         self.api_timeout = int(os.getenv("TG_API_TIMEOUT_SECONDS", "8"))
         self.get_updates_timeout = int(os.getenv("TG_GET_UPDATES_TIMEOUT_SECONDS", "20"))
         self.send_timeout = int(os.getenv("TG_SEND_TIMEOUT_SECONDS", "8"))
         self.edit_timeout = int(os.getenv("TG_EDIT_TIMEOUT_SECONDS", "6"))
         self.copy_timeout = int(os.getenv("TG_COPY_TIMEOUT_SECONDS", "10"))
+        self.callback_timeout = int(os.getenv("TG_CALLBACK_TIMEOUT_SECONDS", "2"))
         self.member_timeout = int(os.getenv("TG_MEMBER_TIMEOUT_SECONDS", "5"))
         self.document_timeout = int(os.getenv("TG_DOCUMENT_TIMEOUT_SECONDS", "25"))
+
+    def opener(self) -> Any:
+        opener = getattr(self._local, "opener", None)
+        if opener is None:
+            opener = urllib.request.build_opener()
+            self._local.opener = opener
+        return opener
 
     def request(self, method: str, payload: dict[str, Any] | None = None, timeout: int | None = None) -> dict[str, Any]:
         if not self.token:
@@ -1576,7 +1584,7 @@ class TelegramAPI:
         )
         for attempt in range(2):
             try:
-                with self.opener.open(req, timeout=timeout) as resp:
+                with self.opener().open(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "replace")
@@ -1691,7 +1699,7 @@ class TelegramAPI:
             method="POST",
         )
         try:
-            with self.opener.open(req, timeout=self.document_timeout) as resp:
+            with self.opener().open(req, timeout=self.document_timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             return {"ok": False, "description": exc.read().decode("utf-8", "replace")}
@@ -1722,7 +1730,7 @@ class TelegramAPI:
         return self.request(
             "answerCallbackQuery",
             {"callback_query_id": callback_id, "text": text[:180], "show_alert": alert},
-            timeout=5,
+            timeout=self.callback_timeout,
         )
 
     def copy_message(self, chat_id: int, from_chat_id: int, message_id: int) -> dict[str, Any]:
@@ -1740,6 +1748,7 @@ class BotApp:
     def __init__(self, store: Store, api: TelegramAPI, admins: set[int]):
         self.store = store
         self.api = api
+        self.bulk_api = TelegramAPI(api.token)
         self.admins = admins
         self.stop_event = threading.Event()
         self.join_cache_seconds = int(os.getenv("JOIN_CACHE_SECONDS", "300"))
@@ -1750,6 +1759,12 @@ class BotApp:
         self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "16")))
         self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "2000")))
         self.background_workers = max(1, int(os.getenv("BACKGROUND_WORKERS", "4")))
+        self.bulk_workers = max(1, int(os.getenv("BULK_WORKERS", "1")))
+        self.bulk_queue_size = max(1, int(os.getenv("BULK_QUEUE_SIZE", "20")))
+        self.bulk_batch_size = max(1, int(os.getenv("BULK_BATCH_SIZE", "25")))
+        self.bulk_batch_sleep = float(os.getenv("BULK_BATCH_SLEEP_SECONDS", "1"))
+        self.bulk_progress_every = max(1, int(os.getenv("BULK_PROGRESS_EVERY", str(self.bulk_batch_size))))
+        self.bulk_retry_sleep_max = float(os.getenv("BULK_RETRY_SLEEP_MAX_SECONDS", "5"))
         self.action_debounce_seconds = float(os.getenv("ACTION_DEBOUNCE_SECONDS", "0.7"))
         self.admin_action_debounce_seconds = float(os.getenv("ADMIN_ACTION_DEBOUNCE_SECONDS", "0.35"))
         self.slow_update_seconds = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "3"))
@@ -1766,6 +1781,9 @@ class BotApp:
         self.update_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self.max_pending_updates)
         self.update_threads: list[threading.Thread] = []
         self._update_workers_started = False
+        self.bulk_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self.bulk_queue_size)
+        self.bulk_threads: list[threading.Thread] = []
+        self._bulk_workers_started = False
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
@@ -1833,6 +1851,7 @@ class BotApp:
         if self._update_workers_started:
             return
         self._update_workers_started = True
+        self.start_bulk_workers()
         for index in range(self.update_workers):
             thread = threading.Thread(
                 target=self.update_worker_loop,
@@ -1841,6 +1860,19 @@ class BotApp:
             )
             thread.start()
             self.update_threads.append(thread)
+
+    def start_bulk_workers(self) -> None:
+        if self._bulk_workers_started:
+            return
+        self._bulk_workers_started = True
+        for index in range(self.bulk_workers):
+            thread = threading.Thread(
+                target=self.bulk_worker_loop,
+                name=f"bot-bulk-{index + 1}",
+                daemon=True,
+            )
+            thread.start()
+            self.bulk_threads.append(thread)
 
     def update_worker_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1860,6 +1892,32 @@ class BotApp:
         except queue.Full:
             print("Update queue full; rejecting webhook update.", flush=True)
             return False
+
+    def enqueue_bulk_job(self, job: dict[str, Any]) -> bool:
+        try:
+            self.bulk_queue.put_nowait(job)
+            return True
+        except queue.Full:
+            print(f"Bulk queue full; rejected job {job.get('type', 'unknown')}.", flush=True)
+            return False
+
+    def bulk_worker_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                job = self.bulk_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            started = time.monotonic()
+            job_type = str(job.get("type", "unknown"))
+            try:
+                self.process_bulk_job(job)
+            except Exception:
+                print(f"Bulk job failed: {job_type}", flush=True)
+                traceback.print_exc()
+            finally:
+                elapsed = time.monotonic() - started
+                print(f"Bulk job {job_type} finished in {elapsed:.2f}s", flush=True)
+                self.bulk_queue.task_done()
 
     def run(self) -> None:
         self.run_polling()
@@ -2266,6 +2324,12 @@ class BotApp:
             else:
                 self.api.send_message(chat_id, "Choose an option.", self.user_keyboard())
 
+    def safe_answer_callback(self, query: dict[str, Any], text: str = "", alert: bool = False) -> None:
+        if query.get("_answered"):
+            return
+        self.api.answer_callback(query["id"], text, alert=alert)
+        query["_answered"] = True
+
     def handle_callback(self, query: dict[str, Any]) -> None:
         user_id = int(query["from"]["id"])
         chat_id = int(query["message"]["chat"]["id"])
@@ -2277,21 +2341,28 @@ class BotApp:
             f"cb:{data}",
             admin=is_admin_user,
         ):
-            self.api.answer_callback(query["id"], "Please wait...", alert=False)
+            self.safe_answer_callback(query, "Please wait...", alert=False)
             return
+        if data.startswith(("adm:", "ap:", "av:", "au:", "at:")) and not is_admin_user:
+            self.safe_answer_callback(query, "Admin only.", alert=True)
+            return
+        if data == "u:stockout":
+            self.safe_answer_callback(query, "This option is stock out right now.", alert=True)
+            return
+        if data == "verify":
+            self.safe_answer_callback(query, "Checking...")
+        elif data.startswith("u:qcustom:"):
+            self.safe_answer_callback(query)
+        else:
+            self.safe_answer_callback(query)
         user = self.store.upsert_user(query["from"])
-        if data not in {"verify", "u:stockout"} and not data.startswith("u:qcustom:"):
-            self.api.answer_callback(query["id"])
 
         if data.startswith("adm:") or data.startswith("ap:") or data.startswith("av:") or data.startswith("au:") or data.startswith("at:"):
-            if not is_admin_user:
-                self.api.answer_callback(query["id"], "Admin only.", alert=True)
-                return
             self.handle_admin_callback(chat_id, message_id, user_id, data)
             return
 
         if is_admin_user:
-            self.api.answer_callback(query["id"], "Admin account uses admin panel only.", alert=True)
+            self.safe_answer_callback(query, "Admin account uses admin panel only.", alert=True)
             self.show_admin_home(chat_id)
             return
 
@@ -2307,13 +2378,12 @@ class BotApp:
             ok, missing = self.join_status(user_id, use_cache=False)
             if ok:
                 self.join_success_cache[user_id] = time.monotonic() + self.join_cache_seconds
-                self.api.answer_callback(query["id"], "Verification successful.")
                 self.api.send_message(chat_id, self.verification_success_text(user), self.reply_keyboard())
             else:
                 detail = ""
                 if missing:
                     detail = "\n\nMissing: " + ", ".join(missing[:5])
-                self.api.answer_callback(query["id"], self.store.setting("verify_failed_text") + detail, alert=True)
+                self.api.send_message(chat_id, self.store.setting("verify_failed_text") + detail, self.join_keyboard())
             return
 
         if not self.join_ok(user_id):
@@ -2322,9 +2392,6 @@ class BotApp:
 
         if data == "u:home":
             self.show_user_home(chat_id, user, message_id=message_id)
-        elif data == "u:stockout":
-            self.api.answer_callback(query["id"], "This option is stock out right now.", alert=True)
-            return
         elif data == "u:products":
             self.show_products(chat_id, user_id, message_id=message_id)
         elif data.startswith("u:p:"):
@@ -2340,10 +2407,8 @@ class BotApp:
             variant_id = int(data.rsplit(":", 1)[1])
             variant = self.store.variant(variant_id)
             if not variant or int(variant["stock_count"]) <= 0:
-                self.api.answer_callback(query["id"], "This option is stock out right now.", alert=True)
                 self.show_quantity(chat_id, user_id, variant_id, message_id=message_id)
                 return
-            self.api.answer_callback(query["id"])
             self.store.set_state(user_id, "custom_quantity", {"variant_id": variant_id})
             self.api.send_message(chat_id, "✏️ Send quantity number.\nExample: 5\n\n/cancel to stop.", self.user_keyboard())
         elif data.startswith("u:confirm:"):
@@ -3800,8 +3865,18 @@ class BotApp:
 
             elif state == "broadcast":
                 self.store.clear_state(admin_id)
-                self.api.send_message(chat_id, "Broadcast started in background. You can keep using the admin panel.", self.admin_keyboard())
-                self.start_background_task("broadcast", self.broadcast_copy_task, admin_id, chat_id, int(msg["message_id"]))
+                queued = self.enqueue_bulk_job(
+                    {
+                        "type": "broadcast_copy",
+                        "admin_id": admin_id,
+                        "from_chat_id": chat_id,
+                        "message_id": int(msg["message_id"]),
+                    }
+                )
+                if queued:
+                    self.api.send_message(chat_id, "Broadcast queued. You can keep using the admin panel.", self.admin_keyboard())
+                else:
+                    self.api.send_message(chat_id, "Broadcast queue is busy. Try again after a moment.", self.admin_keyboard())
 
             elif state in {"addbal", "deduct"}:
                 amount = parse_cents(text, 0)
@@ -3860,17 +3935,79 @@ class BotApp:
         for admin_id in self.admins:
             self.api.send_message(admin_id, text, reply_markup)
 
+    def telegram_retry_after(self, result: dict[str, Any]) -> int:
+        description = str(result.get("description") or "")
+        if not description:
+            return 0
+        try:
+            parsed = json.loads(description)
+            retry_after = int(parsed.get("parameters", {}).get("retry_after", 0))
+            return max(0, retry_after)
+        except Exception:
+            return 1 if "Too Many Requests" in description or "retry after" in description.lower() else 0
+
+    def bulk_sleep_after_result(self, result: dict[str, Any]) -> None:
+        retry_after = self.telegram_retry_after(result)
+        if retry_after > 0:
+            time.sleep(min(float(retry_after), self.bulk_retry_sleep_max))
+            return
+        if self.broadcast_delay > 0:
+            time.sleep(self.broadcast_delay)
+
+    def process_bulk_job(self, job: dict[str, Any]) -> None:
+        job_type = str(job.get("type", ""))
+        if job_type == "broadcast_copy":
+            self.broadcast_copy_task(
+                int(job["admin_id"]),
+                int(job["from_chat_id"]),
+                int(job["message_id"]),
+            )
+            return
+        if job_type == "notify_users":
+            self.notify_users_task(str(job.get("text", "")))
+            return
+        print(f"Unknown bulk job type: {job_type}", flush=True)
+
+    def log_bulk_progress(
+        self,
+        name: str,
+        processed: int,
+        total: int,
+        sent: int,
+        failed: int,
+        *,
+        finished: bool = False,
+    ) -> None:
+        state = "finished" if finished else "progress"
+        print(
+            f"Bulk {name} {state}: processed={processed}/{total} sent={sent} failed={failed} "
+            f"queue={self.bulk_queue.qsize()}",
+            flush=True,
+        )
+
     def broadcast_copy_task(self, admin_id: int, from_chat_id: int, message_id: int) -> None:
+        user_ids = self.store.all_user_ids()
+        total = len(user_ids)
+        print(f"Bulk broadcast started: users={total}", flush=True)
         sent = 0
         failed = 0
-        for user_id in self.store.all_user_ids():
-            result = self.api.copy_message(user_id, from_chat_id, message_id)
+        processed = 0
+        for user_id in user_ids:
+            processed += 1
+            try:
+                result = self.bulk_api.copy_message(user_id, from_chat_id, message_id)
+            except Exception as exc:
+                result = {"ok": False, "description": str(exc)}
             if result.get("ok"):
                 sent += 1
             else:
                 failed += 1
-            if self.broadcast_delay > 0:
-                time.sleep(self.broadcast_delay)
+            self.bulk_sleep_after_result(result)
+            if processed % self.bulk_progress_every == 0:
+                self.log_bulk_progress("broadcast", processed, total, sent, failed)
+            if processed % self.bulk_batch_size == 0 and self.bulk_batch_sleep > 0:
+                time.sleep(self.bulk_batch_sleep)
+        self.log_bulk_progress("broadcast", processed, total, sent, failed, finished=True)
         self.api.send_message(
             admin_id,
             f"Broadcast finished.\nSent: {sent}\nFailed: {failed}",
@@ -3878,15 +4015,35 @@ class BotApp:
         )
 
     def notify_users(self, text: str) -> None:
-        self.start_background_task("notify_users", self.notify_users_task, text)
+        queued = self.enqueue_bulk_job({"type": "notify_users", "text": text})
+        if not queued:
+            print("notify_users skipped: bulk queue is full.", flush=True)
 
     def notify_users_task(self, text: str) -> None:
-        for user_id in self.store.all_user_ids():
+        user_ids = [user_id for user_id in self.store.all_user_ids() if user_id not in self.admins]
+        total = len(user_ids)
+        print(f"Bulk notify_users started: users={total}", flush=True)
+        sent = 0
+        failed = 0
+        processed = 0
+        for user_id in user_ids:
+            processed += 1
             if user_id in self.admins:
                 continue
-            self.api.send_message(user_id, text)
-            if self.broadcast_delay > 0:
-                time.sleep(self.broadcast_delay)
+            try:
+                result = self.bulk_api.send_message(user_id, text)
+            except Exception as exc:
+                result = {"ok": False, "description": str(exc)}
+            if result.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+            self.bulk_sleep_after_result(result)
+            if processed % self.bulk_progress_every == 0:
+                self.log_bulk_progress("notify_users", processed, total, sent, failed)
+            if processed % self.bulk_batch_size == 0 and self.bulk_batch_sleep > 0:
+                time.sleep(self.bulk_batch_sleep)
+        self.log_bulk_progress("notify_users", processed, total, sent, failed, finished=True)
 
 
 def smoke_test() -> None:

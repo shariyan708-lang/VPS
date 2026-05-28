@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import json
 import os
+import queue
 import sqlite3
 import sys
 import threading
@@ -16,6 +17,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -1604,6 +1606,30 @@ class TelegramAPI:
             timeout + 5,
         )
 
+    def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str = "",
+        max_connections: int = 40,
+        drop_pending_updates: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "url": url,
+            "allowed_updates": ["message", "callback_query"],
+            "max_connections": max(1, min(int(max_connections or 40), 100)),
+            "drop_pending_updates": bool(drop_pending_updates),
+        }
+        if secret_token:
+            payload["secret_token"] = secret_token
+        return self.request("setWebhook", payload, timeout=10)
+
+    def delete_webhook(self, *, drop_pending_updates: bool = False) -> dict[str, Any]:
+        return self.request("deleteWebhook", {"drop_pending_updates": bool(drop_pending_updates)}, timeout=10)
+
+    def webhook_info(self) -> dict[str, Any]:
+        return self.request("getWebhookInfo", {}, timeout=10)
+
     def send_message(
         self,
         chat_id: int | str,
@@ -1737,6 +1763,9 @@ class BotApp:
             max_workers=self.background_workers,
             thread_name_prefix="bot-bg",
         )
+        self.update_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self.max_pending_updates)
+        self.update_threads: list[threading.Thread] = []
+        self._update_workers_started = False
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
@@ -1800,35 +1829,174 @@ class BotApp:
         rows.append([{"text": "⬅️ Back", "callback_data": "u:home"}])
         return {"inline_keyboard": rows}
 
+    def start_update_workers(self) -> None:
+        if self._update_workers_started:
+            return
+        self._update_workers_started = True
+        for index in range(self.update_workers):
+            thread = threading.Thread(
+                target=self.update_worker_loop,
+                name=f"bot-update-{index + 1}",
+                daemon=True,
+            )
+            thread.start()
+            self.update_threads.append(thread)
+
+    def update_worker_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                update = self.update_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.handle_update_safely(update)
+            finally:
+                self.update_queue.task_done()
+
+    def enqueue_update(self, update: dict[str, Any]) -> bool:
+        try:
+            self.update_queue.put_nowait(update)
+            return True
+        except queue.Full:
+            print("Update queue full; rejecting webhook update.", flush=True)
+            return False
+
     def run(self) -> None:
+        self.run_polling()
+
+    def run_polling(self) -> None:
         if not self.api.token:
             raise RuntimeError("BOT_TOKEN is required")
+        if os.getenv("POLLING_DELETE_WEBHOOK", "1") == "1":
+            response = self.api.delete_webhook(drop_pending_updates=False)
+            if not response.get("ok"):
+                print("deleteWebhook warning:", response.get("description"), flush=True)
         print(
-            f"Telegram selling bot started. workers={self.update_workers} bg_workers={self.background_workers}",
+            f"Telegram selling bot polling started. workers={self.update_workers} bg_workers={self.background_workers}",
             flush=True,
         )
+        self.start_update_workers()
         offset = 0
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.update_workers,
-            thread_name_prefix="bot-update",
-        ) as executor:
-            pending: set[concurrent.futures.Future[Any]] = set()
-            while not self.stop_event.is_set():
-                response = self.api.get_updates(offset)
-                if not response.get("ok"):
-                    print("Polling error:", response.get("description"), flush=True)
-                    time.sleep(self.polling_error_sleep)
-                    continue
-                for update in response.get("result", []):
-                    offset = max(offset, int(update["update_id"]) + 1)
-                    pending = {future for future in pending if not future.done()}
-                    while len(pending) >= self.max_pending_updates:
-                        _, pending = concurrent.futures.wait(
-                            pending,
-                            timeout=1,
-                            return_when=concurrent.futures.FIRST_COMPLETED,
-                        )
-                    pending.add(executor.submit(self.handle_update_safely, update))
+        while not self.stop_event.is_set():
+            response = self.api.get_updates(offset)
+            if not response.get("ok"):
+                print("Polling error:", response.get("description"), flush=True)
+                time.sleep(self.polling_error_sleep)
+                continue
+            for update in response.get("result", []):
+                offset = max(offset, int(update["update_id"]) + 1)
+                while not self.enqueue_update(update):
+                    time.sleep(0.05)
+
+    def webhook_path(self, webhook_url: str) -> str:
+        configured = os.getenv("WEBHOOK_PATH", "").strip()
+        if configured:
+            path = configured
+        else:
+            path = urllib.parse.urlparse(webhook_url).path or "/telegram-webhook"
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
+
+    def normalized_webhook_url(self) -> str:
+        raw_url = os.getenv("WEBHOOK_URL", "").strip()
+        if not raw_url:
+            raise RuntimeError("WEBHOOK_URL is required when BOT_MODE=webhook")
+        parsed = urllib.parse.urlparse(raw_url)
+        if parsed.scheme != "https":
+            raise RuntimeError("WEBHOOK_URL must be a public https:// URL for Telegram webhook")
+        path = self.webhook_path(raw_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        return base_url + path
+
+    def run_webhook(self) -> None:
+        if not self.api.token:
+            raise RuntimeError("BOT_TOKEN is required")
+        webhook_url = self.normalized_webhook_url()
+        webhook_path = self.webhook_path(webhook_url)
+        secret_token = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+        host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
+        port = int(os.getenv("WEBHOOK_PORT", os.getenv("PORT", "8080")))
+        max_connections = int(os.getenv("WEBHOOK_MAX_CONNECTIONS", "40"))
+        drop_pending = os.getenv("WEBHOOK_DROP_PENDING_UPDATES", "0") == "1"
+        max_body = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "1048576"))
+
+        self.start_update_workers()
+        if os.getenv("WEBHOOK_SET_ON_START", "1") == "1":
+            response = self.api.set_webhook(
+                webhook_url,
+                secret_token=secret_token,
+                max_connections=max_connections,
+                drop_pending_updates=drop_pending,
+            )
+            if not response.get("ok"):
+                raise RuntimeError(f"setWebhook failed: {response.get('description')}")
+
+        app = self
+
+        class WebhookHandler(BaseHTTPRequestHandler):
+            server_version = "TelegramSellingBotWebhook/1.0"
+
+            def send_plain(self, status: int, body: str = "ok") -> None:
+                data = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                path = urllib.parse.urlparse(self.path).path
+                if path in {"/", "/health", webhook_path}:
+                    self.send_plain(200, "ok")
+                    return
+                self.send_plain(404, "not found")
+
+            def do_POST(self) -> None:
+                path = urllib.parse.urlparse(self.path).path
+                if path != webhook_path:
+                    self.send_plain(404, "not found")
+                    return
+                if secret_token and self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != secret_token:
+                    self.send_plain(401, "unauthorized")
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self.send_plain(400, "bad length")
+                    return
+                if length <= 0 or length > max_body:
+                    self.send_plain(413, "too large")
+                    return
+                try:
+                    raw = self.rfile.read(length)
+                    update = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    self.send_plain(400, "bad json")
+                    return
+                if not isinstance(update, dict):
+                    self.send_plain(400, "bad update")
+                    return
+                if not app.enqueue_update(update):
+                    self.send_plain(503, "queue full")
+                    return
+                self.send_plain(200, "ok")
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                if os.getenv("WEBHOOK_ACCESS_LOG", "0") == "1":
+                    print(f"Webhook {self.address_string()} - {fmt % args}", flush=True)
+
+        server = ThreadingHTTPServer((host, port), WebhookHandler)
+        server.daemon_threads = True
+        print(
+            f"Telegram selling bot webhook started. url={webhook_url} bind={host}:{port} path={webhook_path} "
+            f"workers={self.update_workers} queue={self.max_pending_updates}",
+            flush=True,
+        )
+        try:
+            server.serve_forever(poll_interval=0.5)
+        finally:
+            server.server_close()
 
     def handle_update_safely(self, update: dict[str, Any]) -> None:
         started = time.monotonic()
@@ -3760,6 +3928,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Telegram-only selling bot with Telegram admin panel.")
     parser.add_argument("--init-db", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--set-webhook", action="store_true")
+    parser.add_argument("--delete-webhook", action="store_true")
+    parser.add_argument("--webhook-info", action="store_true")
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -3778,8 +3949,37 @@ def main() -> int:
     admin_ids = parse_admin_ids(os.getenv("ADMIN_IDS", os.getenv("ADMIN_CHAT_IDS", "")))
     if not admin_ids:
         print("Warning: ADMIN_IDS is empty. No one can open /admin.")
-    app = BotApp(store, TelegramAPI(token), admin_ids)
-    app.run()
+    api = TelegramAPI(token)
+    app = BotApp(store, api, admin_ids)
+
+    if args.delete_webhook:
+        print(json.dumps(api.delete_webhook(drop_pending_updates=False), ensure_ascii=False, indent=2))
+        return 0
+    if args.webhook_info:
+        print(json.dumps(api.webhook_info(), ensure_ascii=False, indent=2))
+        return 0
+    if args.set_webhook:
+        print(
+            json.dumps(
+                api.set_webhook(
+                    app.normalized_webhook_url(),
+                    secret_token=os.getenv("WEBHOOK_SECRET_TOKEN", "").strip(),
+                    max_connections=int(os.getenv("WEBHOOK_MAX_CONNECTIONS", "40")),
+                    drop_pending_updates=os.getenv("WEBHOOK_DROP_PENDING_UPDATES", "0") == "1",
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    mode = os.getenv("BOT_MODE", "polling").strip().lower()
+    if mode == "webhook":
+        app.run_webhook()
+    elif mode == "polling":
+        app.run_polling()
+    else:
+        raise RuntimeError("BOT_MODE must be polling or webhook")
     return 0
 
 

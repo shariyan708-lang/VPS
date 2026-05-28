@@ -19,6 +19,7 @@ Normal Telegram bot for selling license keys/products. This is not a website and
 - Neon PostgreSQL support through `DATABASE_URL`
 - SQLite fallback for local testing
 - PostgreSQL reconnect/keepalive, cached settings, cached join checks and optimized indexes
+- Webhook mode with fast HTTP acknowledge and background worker queue
 - Thread-local PostgreSQL connections for parallel VPS traffic
 - Purchase/redeem row locks to prevent duplicate stock delivery under heavy clicks
 - Concurrent update workers and shorter Telegram API timeouts to prevent one slow request from freezing the bot
@@ -99,6 +100,15 @@ Full Bengali guide: `VPS_DEPLOY_GUIDE_BN.md`.
 BOT_TOKEN=your_bot_token
 ADMIN_IDS=your_numeric_telegram_user_id
 BOT_USERNAME=your_bot_username_without_@
+BOT_MODE=webhook
+WEBHOOK_URL=https://bot.example.com/telegram-webhook
+WEBHOOK_PATH=/telegram-webhook
+WEBHOOK_SECRET_TOKEN=use_a_random_secret
+WEBHOOK_HOST=0.0.0.0
+WEBHOOK_PORT=8080
+WEBHOOK_MAX_CONNECTIONS=40
+WEBHOOK_SET_ON_START=1
+POLLING_DELETE_WEBHOOK=1
 DATABASE_URL=
 DB_PATH=data/telegram_selling_bot.sqlite3
 JOIN_CACHE_SECONDS=300
@@ -131,6 +141,31 @@ BROADCAST_DELAY_SECONDS=0.025
 Leave `DATABASE_URL=` empty only for small local SQLite testing. For a public VPS bot with many users, use PostgreSQL in `DATABASE_URL` so update workers can process database requests in parallel.
 
 Use only one running bot process for one `BOT_TOKEN`. Do not run the same bot token on VPS and another host at the same time.
+
+## Webhook Mode
+
+Webhook mode is recommended for public VPS hosting. Telegram sends updates to your HTTPS URL instantly, the bot replies `200 OK` immediately, then processes the update in the internal worker queue.
+
+Required:
+
+```env
+BOT_MODE=webhook
+WEBHOOK_URL=https://your-domain.com/telegram-webhook
+WEBHOOK_SECRET_TOKEN=long_random_secret
+WEBHOOK_PORT=8080
+```
+
+Put Nginx/Caddy/Cloudflare in front of the bot and proxy the public HTTPS URL to `127.0.0.1:8080`. Check webhook status:
+
+```bash
+.venv/bin/python selling_bot.py --webhook-info
+```
+
+Switch back to polling:
+
+```bash
+.venv/bin/python selling_bot.py --delete-webhook
+```
 
 ## Local Test
 

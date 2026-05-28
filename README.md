@@ -20,6 +20,7 @@ Normal Telegram bot for selling license keys/products. This is not a website and
 - SQLite fallback for local testing
 - PostgreSQL reconnect/keepalive, cached settings, cached join checks and optimized indexes
 - Webhook mode with fast HTTP acknowledge and background worker queue
+- Separate bounded bulk queue for broadcast/maintenance notifications
 - Thread-local PostgreSQL connections for parallel VPS traffic
 - Purchase/redeem row locks to prevent duplicate stock delivery under heavy clicks
 - Concurrent update workers and shorter Telegram API timeouts to prevent one slow request from freezing the bot
@@ -119,6 +120,12 @@ USER_TOUCH_SECONDS=60
 UPDATE_WORKERS=16
 MAX_PENDING_UPDATES=2000
 BACKGROUND_WORKERS=4
+BULK_WORKERS=1
+BULK_QUEUE_SIZE=20
+BULK_BATCH_SIZE=25
+BULK_BATCH_SLEEP_SECONDS=1
+BULK_PROGRESS_EVERY=25
+BULK_RETRY_SLEEP_MAX_SECONDS=5
 ACTION_DEBOUNCE_SECONDS=0.7
 ADMIN_ACTION_DEBOUNCE_SECONDS=0.35
 SLOW_UPDATE_LOG_SECONDS=3
@@ -128,6 +135,7 @@ TG_GET_UPDATES_TIMEOUT_SECONDS=20
 TG_SEND_TIMEOUT_SECONDS=8
 TG_EDIT_TIMEOUT_SECONDS=6
 TG_COPY_TIMEOUT_SECONDS=10
+TG_CALLBACK_TIMEOUT_SECONDS=2
 TG_MEMBER_TIMEOUT_SECONDS=5
 TG_DOCUMENT_TIMEOUT_SECONDS=25
 PG_CONNECT_TIMEOUT=10

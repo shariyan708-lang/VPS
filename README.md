@@ -19,8 +19,10 @@ Normal Telegram bot for selling license keys/products. This is not a website and
 - Neon PostgreSQL support through `DATABASE_URL`
 - SQLite fallback for local testing
 - PostgreSQL reconnect/keepalive, cached settings, cached join checks and optimized indexes
+- Thread-local PostgreSQL connections for parallel VPS traffic
+- Purchase/redeem row locks to prevent duplicate stock delivery under heavy clicks
 - Concurrent update workers and shorter Telegram API timeouts to prevent one slow request from freezing the bot
-- Duplicate click protection for busy users tapping the same button many times
+- In-flight duplicate click protection for busy users tapping the same button many times
 - Background broadcast/maintenance notifications so admin panel stays responsive
 - VPS systemd scripts for 24/7 hosting
 
@@ -104,13 +106,13 @@ FAILED_JOIN_CACHE_SECONDS=20
 SETTINGS_CACHE_SECONDS=5
 DB_SLOW_LOG_SECONDS=1.5
 USER_TOUCH_SECONDS=60
-UPDATE_WORKERS=8
-MAX_PENDING_UPDATES=500
-BACKGROUND_WORKERS=2
-ACTION_DEBOUNCE_SECONDS=1.2
-ADMIN_ACTION_DEBOUNCE_SECONDS=0.7
+UPDATE_WORKERS=16
+MAX_PENDING_UPDATES=2000
+BACKGROUND_WORKERS=4
+ACTION_DEBOUNCE_SECONDS=0.7
+ADMIN_ACTION_DEBOUNCE_SECONDS=0.35
 SLOW_UPDATE_LOG_SECONDS=3
-POLLING_ERROR_SLEEP_SECONDS=2
+POLLING_ERROR_SLEEP_SECONDS=1
 TG_API_TIMEOUT_SECONDS=8
 TG_GET_UPDATES_TIMEOUT_SECONDS=20
 TG_SEND_TIMEOUT_SECONDS=8
@@ -126,7 +128,7 @@ PG_RECONNECT_LOG_SECONDS=60
 BROADCAST_DELAY_SECONDS=0.025
 ```
 
-Leave `DATABASE_URL=` empty for local VPS SQLite database. Use PostgreSQL/Neon URL only if you want an external PostgreSQL database.
+Leave `DATABASE_URL=` empty only for small local SQLite testing. For a public VPS bot with many users, use PostgreSQL in `DATABASE_URL` so update workers can process database requests in parallel.
 
 Use only one running bot process for one `BOT_TOKEN`. Do not run the same bot token on VPS and another host at the same time.
 

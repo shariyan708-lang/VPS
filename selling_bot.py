@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import sqlite3
@@ -209,6 +210,28 @@ def float_env(name: str, default: float) -> float:
         return default
 
 
+class ThreadLocalPgConnection:
+    def __init__(self, store: "Store"):
+        self.store = store
+
+    def _conn(self) -> Any:
+        return self.store.thread_pg_conn()
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        return self._conn().execute(*args, **kwargs)
+
+    def cursor(self, *args: Any, **kwargs: Any) -> Any:
+        return self._conn().cursor(*args, **kwargs)
+
+    def close(self) -> None:
+        self.store.close_thread_pg_conn()
+
+    @property
+    def closed(self) -> bool:
+        conn = getattr(self.store._pg_local, "conn", None)
+        return bool(conn is None or getattr(conn, "closed", False))
+
+
 class Store:
     def __init__(self, db_path: Path | None = None, database_url: str = ""):
         self.lock = threading.RLock()
@@ -223,6 +246,7 @@ class Store:
         self._settings_cache_until = 0.0
         self._channels_cache: dict[bool, tuple[float, list[Any]]] = {}
         self._user_touch_cache: dict[int, float] = {}
+        self._pg_local = threading.local()
         self.psycopg = None
         self.pg_dict_row = None
         if self.is_pg:
@@ -235,7 +259,7 @@ class Store:
                 ) from exc
             self.psycopg = psycopg
             self.pg_dict_row = dict_row
-            self.conn = self.connect_pg()
+            self.conn = ThreadLocalPgConnection(self)
         else:
             path = db_path or DEFAULT_DB
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,6 +299,26 @@ class Store:
         conn.autocommit = True
         return conn
 
+    def thread_pg_conn(self) -> Any:
+        conn = getattr(self._pg_local, "conn", None)
+        if conn is None or getattr(conn, "closed", False):
+            conn = self.connect_pg()
+            self._pg_local.conn = conn
+        return conn
+
+    def close_thread_pg_conn(self) -> None:
+        conn = getattr(self._pg_local, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        self._pg_local.conn = None
+
+    def db_guard(self) -> Any:
+        return contextlib.nullcontext() if self.is_pg else self.lock
+
     def is_connection_error(self, exc: Exception) -> bool:
         if not self.is_pg or self.psycopg is None:
             return False
@@ -294,17 +338,14 @@ class Store:
             return
         if log:
             self.log_pg_reconnect()
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-        self.conn = self.connect_pg()
+        self.close_thread_pg_conn()
+        self.thread_pg_conn()
         self.invalidate_settings_cache()
         self.invalidate_channels_cache()
 
     def ensure_pg_connection(self) -> None:
-        if self.is_pg and getattr(self.conn, "closed", False):
-            self.reconnect_pg()
+        if self.is_pg:
+            self.thread_pg_conn()
 
     def retry_pg_once(self, action: Any) -> Any:
         for attempt in range(2):
@@ -327,7 +368,7 @@ class Store:
         all_rows: bool = False,
     ) -> Any:
         started = time.monotonic()
-        with self.lock:
+        with self.db_guard():
             def run() -> Any:
                 cur = self.conn.execute(self.q(sql), params)
                 result = None
@@ -347,7 +388,7 @@ class Store:
         if not rows:
             return 0
         started = time.monotonic()
-        with self.lock:
+        with self.db_guard():
             def run() -> int:
                 self.begin()
                 try:
@@ -647,7 +688,7 @@ class Store:
                 "CREATE TABLE IF NOT EXISTS admin_states (admin_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)",
             ]
-        with self.lock:
+        with self.db_guard():
             for statement in statements:
                 self.conn.execute(statement)
             if not self.is_pg:
@@ -671,7 +712,7 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_redeem_claims_user ON redeem_claims(user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_admin_states_updated ON admin_states(updated_at)",
         ]
-        with self.lock:
+        with self.db_guard():
             for statement in indexes:
                 self.conn.execute(statement)
             if not self.is_pg:
@@ -685,7 +726,7 @@ class Store:
         self._channels_cache.clear()
 
     def table_columns(self, table: str) -> set[str]:
-        with self.lock:
+        with self.db_guard():
             if self.is_pg:
                 rows = self.conn.execute(
                     "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
@@ -698,7 +739,7 @@ class Store:
     def add_column_if_missing(self, table: str, column: str, definition: str) -> None:
         if column in self.table_columns(table):
             return
-        with self.lock:
+        with self.db_guard():
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             if not self.is_pg:
                 self.conn.commit()
@@ -837,7 +878,7 @@ class Store:
             return existing
 
         started = time.monotonic()
-        with self.lock:
+        with self.db_guard():
             self.begin()
             try:
                 self.conn.execute(
@@ -1170,10 +1211,13 @@ class Store:
         stamp = now_iso()
         quantity = max(1, min(int(quantity or 1), 50))
         started = time.monotonic()
-        with self.lock:
+        with self.db_guard():
             self.begin()
             try:
-                user = self.conn.execute(self.q("SELECT * FROM users WHERE user_id = ?"), (user_id,)).fetchone()
+                user_sql = "SELECT * FROM users WHERE user_id = ?"
+                if self.is_pg:
+                    user_sql += " FOR UPDATE"
+                user = self.conn.execute(self.q(user_sql), (user_id,)).fetchone()
                 variant = self.conn.execute(
                     self.q(
                         """
@@ -1211,15 +1255,16 @@ class Store:
                         "quantity": quantity,
                     }
 
+                stock_sql = """
+                    SELECT * FROM stock_items
+                    WHERE variant_id = ? AND status = 'available'
+                    ORDER BY id ASC
+                    LIMIT ?
+                """
+                if self.is_pg:
+                    stock_sql += " FOR UPDATE SKIP LOCKED"
                 stock_rows = self.conn.execute(
-                    self.q(
-                        """
-                        SELECT * FROM stock_items
-                        WHERE variant_id = ? AND status = 'available'
-                        ORDER BY id ASC
-                        LIMIT ?
-                        """
-                    ),
+                    self.q(stock_sql),
                     (variant_id, quantity),
                 ).fetchall()
                 if len(stock_rows) < quantity:
@@ -1338,10 +1383,13 @@ class Store:
 
     def update_topup(self, topup_id: int, status: str, note: str = "") -> Any:
         stamp = now_iso()
-        with self.lock:
+        with self.db_guard():
             self.begin()
             try:
-                topup = self.conn.execute(self.q("SELECT * FROM topups WHERE id = ?"), (topup_id,)).fetchone()
+                topup_sql = "SELECT * FROM topups WHERE id = ?"
+                if self.is_pg:
+                    topup_sql += " FOR UPDATE"
+                topup = self.conn.execute(self.q(topup_sql), (topup_id,)).fetchone()
                 if not topup:
                     self.rollback()
                     return None
@@ -1396,11 +1444,14 @@ class Store:
         clean_code = code.strip().upper()
         stamp = now_iso()
         started = time.monotonic()
-        with self.lock:
+        with self.db_guard():
             self.begin()
             try:
+                redeem_sql = "SELECT * FROM redeem_codes WHERE code = ?"
+                if self.is_pg:
+                    redeem_sql += " FOR UPDATE"
                 row = self.conn.execute(
-                    self.q("SELECT * FROM redeem_codes WHERE code = ?"),
+                    self.q(redeem_sql),
                     (clean_code,),
                 ).fetchone()
                 if not row or not int(row["active"]):
@@ -1670,15 +1721,16 @@ class BotApp:
         self.join_success_cache: dict[int, float] = {}
         self.join_failure_cache: dict[int, tuple[float, list[str]]] = {}
         self.broadcast_delay = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.025"))
-        self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "8")))
-        self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "500")))
-        self.background_workers = max(1, int(os.getenv("BACKGROUND_WORKERS", "2")))
-        self.action_debounce_seconds = float(os.getenv("ACTION_DEBOUNCE_SECONDS", "1.2"))
-        self.admin_action_debounce_seconds = float(os.getenv("ADMIN_ACTION_DEBOUNCE_SECONDS", "0.7"))
+        self.update_workers = max(1, int(os.getenv("UPDATE_WORKERS", "16")))
+        self.max_pending_updates = max(self.update_workers, int(os.getenv("MAX_PENDING_UPDATES", "2000")))
+        self.background_workers = max(1, int(os.getenv("BACKGROUND_WORKERS", "4")))
+        self.action_debounce_seconds = float(os.getenv("ACTION_DEBOUNCE_SECONDS", "0.7"))
+        self.admin_action_debounce_seconds = float(os.getenv("ADMIN_ACTION_DEBOUNCE_SECONDS", "0.35"))
         self.slow_update_seconds = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "3"))
-        self.polling_error_sleep = float(os.getenv("POLLING_ERROR_SLEEP_SECONDS", "2"))
+        self.polling_error_sleep = float(os.getenv("POLLING_ERROR_SLEEP_SECONDS", "1"))
         self._recent_action_lock = threading.Lock()
         self._recent_actions: dict[tuple[int, str], float] = {}
+        self._inflight_actions: set[tuple[int, str]] = set()
         self._user_locks_guard = threading.Lock()
         self._user_locks: dict[int, threading.Lock] = {}
         self.background_executor = concurrent.futures.ThreadPoolExecutor(
@@ -1780,16 +1832,32 @@ class BotApp:
 
     def handle_update_safely(self, update: dict[str, Any]) -> None:
         started = time.monotonic()
+        user_id: int | None = None
+        action_key = ""
+        action_started = False
         try:
             user_id = self.update_user_id(update)
             if user_id is None:
                 self.handle_update(update)
             else:
+                action_key = self.update_action_key(update)
+                if action_key and not self.start_update_action(
+                    user_id,
+                    action_key,
+                    admin=self.is_admin(user_id),
+                ):
+                    self.answer_debounced_update(update)
+                    return
+                if action_key:
+                    action_started = True
+                    self.mark_debounce_checked(update)
                 with self.user_lock(user_id):
                     self.handle_update(update)
         except Exception:
             traceback.print_exc()
         finally:
+            if action_started and user_id is not None:
+                self.finish_update_action(user_id, action_key)
             elapsed = time.monotonic() - started
             if elapsed >= self.slow_update_seconds:
                 update_id = update.get("update_id", "-")
@@ -1805,6 +1873,26 @@ class BotApp:
         except Exception:
             return None
         return None
+
+    def update_action_key(self, update: dict[str, Any]) -> str:
+        if "message" in update:
+            text = str(update["message"].get("text") or "")
+            return self.message_action_key(text)
+        if "callback_query" in update:
+            data = str(update["callback_query"].get("data") or "")
+            return f"cb:{data}" if data else ""
+        return ""
+
+    def mark_debounce_checked(self, update: dict[str, Any]) -> None:
+        if "message" in update:
+            update["message"]["_debounce_checked"] = True
+        elif "callback_query" in update:
+            update["callback_query"]["_debounce_checked"] = True
+
+    def answer_debounced_update(self, update: dict[str, Any]) -> None:
+        query = update.get("callback_query")
+        if query and query.get("id"):
+            self.api.answer_callback(query["id"], "Please wait...", alert=False)
 
     def user_lock(self, user_id: int) -> threading.Lock:
         with self._user_locks_guard:
@@ -1833,6 +1921,35 @@ class BotApp:
                     if old_time >= cutoff
                 }
             return False
+
+    def start_update_action(self, user_id: int, action: str, admin: bool = False) -> bool:
+        seconds = self.admin_action_debounce_seconds if admin else self.action_debounce_seconds
+        if not action:
+            return True
+        now = time.monotonic()
+        key = (user_id, action)
+        with self._recent_action_lock:
+            if key in self._inflight_actions:
+                return False
+            last = self._recent_actions.get(key, 0)
+            if seconds > 0 and now - last < seconds:
+                return False
+            self._recent_actions[key] = now
+            self._inflight_actions.add(key)
+            if len(self._recent_actions) > 50000:
+                cutoff = now - max(seconds * 4, 10)
+                self._recent_actions = {
+                    old_key: old_time
+                    for old_key, old_time in self._recent_actions.items()
+                    if old_time >= cutoff
+                }
+            return True
+
+    def finish_update_action(self, user_id: int, action: str) -> None:
+        if not action:
+            return
+        with self._recent_action_lock:
+            self._inflight_actions.discard((user_id, action))
 
     def message_action_key(self, text: str) -> str:
         button = text.strip().lower()
@@ -1886,8 +2003,8 @@ class BotApp:
         chat_id = int(msg["chat"]["id"])
         text = (msg.get("text") or "").strip()
         action_key = self.message_action_key(text)
-        debounced_before_db = False
-        if action_key and not self.is_admin(user_id):
+        debounced_before_db = bool(msg.get("_debounce_checked"))
+        if action_key and not debounced_before_db and not self.is_admin(user_id):
             if self.should_debounce_action(user_id, action_key, admin=False):
                 return
             debounced_before_db = True
@@ -1987,7 +2104,11 @@ class BotApp:
         message_id = int(query["message"]["message_id"])
         data = query.get("data") or ""
         is_admin_user = self.is_admin(user_id)
-        if self.should_debounce_action(user_id, f"cb:{data}", admin=is_admin_user):
+        if not query.get("_debounce_checked") and self.should_debounce_action(
+            user_id,
+            f"cb:{data}",
+            admin=is_admin_user,
+        ):
             self.api.answer_callback(query["id"], "Please wait...", alert=False)
             return
         user = self.store.upsert_user(query["from"])

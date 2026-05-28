@@ -18,7 +18,6 @@ CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_topups_status_created ON topups(status, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_redeem_codes_active ON redeem_codes(active, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_redeem_claims_code_user_unique ON redeem_claims(code, user_id);
 CREATE INDEX IF NOT EXISTS idx_redeem_claims_user ON redeem_claims(user_id, created_at DESC);
 
 ANALYZE users;

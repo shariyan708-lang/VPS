@@ -21,7 +21,6 @@ Normal Telegram bot for selling license keys/products. This is not a website and
 - PostgreSQL reconnect/keepalive, cached settings, cached join checks and optimized indexes
 - Webhook mode with fast HTTP acknowledge and background worker queue
 - Separate bounded bulk queue for broadcast/maintenance notifications
-- Cached user/profile/referral/product menu reads for faster repeated button taps
 - Thread-local PostgreSQL connections for parallel VPS traffic
 - Purchase/redeem row locks to prevent duplicate stock delivery under heavy clicks
 - Concurrent update workers and shorter Telegram API timeouts to prevent one slow request from freezing the bot
@@ -110,14 +109,12 @@ WEBHOOK_HOST=0.0.0.0
 WEBHOOK_PORT=8080
 WEBHOOK_MAX_CONNECTIONS=40
 WEBHOOK_SET_ON_START=1
+POLLING_DELETE_WEBHOOK=1
 DATABASE_URL=
 DB_PATH=data/telegram_selling_bot.sqlite3
 JOIN_CACHE_SECONDS=300
 FAILED_JOIN_CACHE_SECONDS=20
 SETTINGS_CACHE_SECONDS=5
-USER_CACHE_SECONDS=5
-REFERRAL_CACHE_SECONDS=10
-PRODUCT_CACHE_SECONDS=5
 DB_SLOW_LOG_SECONDS=1.5
 USER_TOUCH_SECONDS=60
 UPDATE_WORKERS=16
@@ -132,7 +129,9 @@ BULK_RETRY_SLEEP_MAX_SECONDS=5
 ACTION_DEBOUNCE_SECONDS=0.7
 ADMIN_ACTION_DEBOUNCE_SECONDS=0.35
 SLOW_UPDATE_LOG_SECONDS=3
+POLLING_ERROR_SLEEP_SECONDS=1
 TG_API_TIMEOUT_SECONDS=8
+TG_GET_UPDATES_TIMEOUT_SECONDS=20
 TG_SEND_TIMEOUT_SECONDS=8
 TG_EDIT_TIMEOUT_SECONDS=6
 TG_COPY_TIMEOUT_SECONDS=10
@@ -170,22 +169,19 @@ Put Nginx/Caddy/Cloudflare in front of the bot and proxy the public HTTPS URL to
 .venv/bin/python selling_bot.py --webhook-info
 ```
 
-Delete webhook for maintenance or token reset:
+Switch back to polling:
 
 ```bash
 .venv/bin/python selling_bot.py --delete-webhook
 ```
-
-Runtime remains webhook-only. Start the service again with `BOT_MODE=webhook` and a valid `WEBHOOK_URL`.
 
 ## Local Test
 
 ```bash
 python selling_bot.py --init-db
 python selling_bot.py --smoke-test
+python selling_bot.py
 ```
-
-Running the live bot requires webhook env values and a public HTTPS `WEBHOOK_URL`.
 
 ## Neon Optimization
 

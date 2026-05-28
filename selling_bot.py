@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import concurrent.futures
@@ -247,13 +247,7 @@ class Store:
         self._settings_cache: dict[str, str] | None = None
         self._settings_cache_until = 0.0
         self._channels_cache: dict[bool, tuple[float, list[Any]]] = {}
-        self._products_cache: dict[bool, tuple[float, list[Any]]] = {}
-        self.product_cache_seconds = float_env("PRODUCT_CACHE_SECONDS", 5)
-        self.referral_cache_seconds = float_env("REFERRAL_CACHE_SECONDS", 10)
-        self._referral_count_cache: dict[int, tuple[float, int]] = {}
         self._user_touch_cache: dict[int, float] = {}
-        self.user_cache_seconds = float_env("USER_CACHE_SECONDS", 5)
-        self._user_cache: dict[int, tuple[float, Any]] = {}
         self._pg_local = threading.local()
         self.psycopg = None
         self.pg_dict_row = None
@@ -717,7 +711,6 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_topups_status_created ON topups(status, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_redeem_codes_active ON redeem_codes(active, created_at)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_redeem_claims_code_user_unique ON redeem_claims(code, user_id)",
             "CREATE INDEX IF NOT EXISTS idx_redeem_claims_user ON redeem_claims(user_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_admin_states_updated ON admin_states(updated_at)",
         ]
@@ -733,16 +726,6 @@ class Store:
 
     def invalidate_channels_cache(self) -> None:
         self._channels_cache.clear()
-
-    def invalidate_user_cache(self, user_id: int) -> None:
-        self._user_cache.pop(int(user_id), None)
-
-    def invalidate_referral_cache(self, user_id: int | None) -> None:
-        if user_id is not None:
-            self._referral_count_cache.pop(int(user_id), None)
-
-    def invalidate_products_cache(self) -> None:
-        self._products_cache.clear()
 
     def table_columns(self, table: str) -> set[str]:
         with self.db_guard():
@@ -825,12 +808,12 @@ class Store:
 
     def settings_map(self) -> dict[str, str]:
         if self._settings_cache is not None and time.monotonic() < self._settings_cache_until:
-            return self._settings_cache
+            return dict(self._settings_cache)
         rows = self.execute("SELECT key, value FROM settings", all_rows=True)
         settings = {str(row["key"]): str(row["value"]) for row in rows}
         self._settings_cache = settings
         self._settings_cache_until = time.monotonic() + self.settings_cache_seconds
-        return settings
+        return dict(settings)
 
     def set_state(self, admin_id: int, state: str, data: dict[str, Any] | None = None) -> None:
         self.execute(
@@ -893,7 +876,6 @@ class Store:
                     """,
                     (username, first_name, last_name, stamp, user_id),
                 )
-                self.invalidate_user_cache(user_id)
                 self._user_touch_cache[user_id] = now + self.user_touch_seconds
             return existing
 
@@ -928,8 +910,6 @@ class Store:
                             stamp,
                         ),
                     )
-                    self.invalidate_user_cache(clean_referrer)
-                    self.invalidate_referral_cache(clean_referrer)
                 self.commit()
             except Exception:
                 self.rollback()
@@ -937,17 +917,10 @@ class Store:
             finally:
                 self.log_slow_db("upsert_user transaction", started)
         self._user_touch_cache[user_id] = time.monotonic() + self.user_touch_seconds
-        self.invalidate_user_cache(user_id)
         return self.user(user_id)
 
     def user(self, user_id: int) -> Any:
-        cached = self._user_cache.get(int(user_id))
-        if cached and time.monotonic() < cached[0]:
-            return cached[1]
-        row = self.execute("SELECT * FROM users WHERE user_id = ?", (user_id,), one=True)
-        if row:
-            self._user_cache[int(user_id)] = (time.monotonic() + self.user_cache_seconds, row)
-        return row
+        return self.execute("SELECT * FROM users WHERE user_id = ?", (user_id,), one=True)
 
     def users(self, limit: int = 20, offset: int = 0, balance_only: bool = False) -> list[Any]:
         where = "WHERE balance_cents > 0" if balance_only else ""
@@ -963,17 +936,12 @@ class Store:
         return int(row["n"])
 
     def referral_count(self, referrer_id: int) -> int:
-        cached = self._referral_count_cache.get(int(referrer_id))
-        if cached and time.monotonic() < cached[0]:
-            return cached[1]
         row = self.execute(
             "SELECT COUNT(*) AS n FROM users WHERE referred_by = ?",
             (referrer_id,),
             one=True,
         )
-        count = int(row["n"])
-        self._referral_count_cache[int(referrer_id)] = (time.monotonic() + self.referral_cache_seconds, count)
-        return count
+        return int(row["n"])
 
     def all_user_ids(self) -> list[int]:
         rows = self.execute("SELECT user_id FROM users WHERE is_banned = 0 ORDER BY created_at ASC", all_rows=True)
@@ -984,7 +952,6 @@ class Store:
             "UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?",
             (amount_cents, now_iso(), user_id),
         )
-        self.invalidate_user_cache(user_id)
         self.log(actor, "adjust_balance", f"user={user_id}; amount_cents={amount_cents}")
 
     def set_ban(self, user_id: int, banned: bool, actor: str) -> None:
@@ -992,7 +959,6 @@ class Store:
             "UPDATE users SET is_banned = ?, updated_at = ? WHERE user_id = ?",
             (1 if banned else 0, now_iso(), user_id),
         )
-        self.invalidate_user_cache(user_id)
         self.log(actor, "ban" if banned else "unban", f"user={user_id}")
 
     def channels(self, enabled_only: bool = False) -> list[Any]:
@@ -1028,11 +994,8 @@ class Store:
         self.invalidate_channels_cache()
 
     def products(self, active_only: bool = False) -> list[Any]:
-        cached = self._products_cache.get(active_only)
-        if cached and time.monotonic() < cached[0]:
-            return list(cached[1])
         where = "WHERE p.active = 1" if active_only else ""
-        rows = self.execute(
+        return self.execute(
             f"""
             SELECT p.*,
                 (SELECT COUNT(*) FROM product_variants v WHERE v.product_id = p.id) AS variant_count
@@ -1042,8 +1005,6 @@ class Store:
             """,
             all_rows=True,
         )
-        self._products_cache[active_only] = (time.monotonic() + self.product_cache_seconds, rows)
-        return list(rows)
 
     def product(self, product_id: int) -> Any:
         return self.execute("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
@@ -1060,7 +1021,6 @@ class Store:
                 (title.strip(), emoji, description.strip(), stamp, stamp),
                 one=True,
             )
-            self.invalidate_products_cache()
             return int(row["id"])
         cur = self.execute(
             """
@@ -1069,7 +1029,6 @@ class Store:
             """,
             (title.strip(), emoji, description.strip(), stamp, stamp),
         )
-        self.invalidate_products_cache()
         return int(cur.lastrowid)
 
     def set_product_emoji(self, product_id: int, emoji: str) -> None:
@@ -1077,14 +1036,12 @@ class Store:
             "UPDATE products SET emoji = ?, updated_at = ? WHERE id = ?",
             (normalize_product_icon(emoji), now_iso(), product_id),
         )
-        self.invalidate_products_cache()
 
     def toggle_product(self, product_id: int) -> None:
         self.execute(
             "UPDATE products SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END, updated_at = ? WHERE id = ?",
             (now_iso(), product_id),
         )
-        self.invalidate_products_cache()
 
     def product_order_count(self, product_id: int) -> int:
         row = self.execute("SELECT COUNT(*) AS n FROM orders WHERE product_id = ?", (product_id,), one=True)
@@ -1095,10 +1052,8 @@ class Store:
             stamp = now_iso()
             self.execute("UPDATE products SET active = 0, updated_at = ? WHERE id = ?", (stamp, product_id))
             self.execute("UPDATE product_variants SET active = 0, updated_at = ? WHERE product_id = ?", (stamp, product_id))
-            self.invalidate_products_cache()
             return "hidden"
         self.execute("DELETE FROM products WHERE id = ?", (product_id,))
-        self.invalidate_products_cache()
         return "deleted"
 
     def variants(self, product_id: int | None = None, active_only: bool = False) -> list[Any]:
@@ -1149,7 +1104,6 @@ class Store:
                 (product_id, title.strip(), days, price_cents, stamp, stamp),
                 one=True,
             )
-            self.invalidate_products_cache()
             return int(row["id"])
         cur = self.execute(
             """
@@ -1158,7 +1112,6 @@ class Store:
             """,
             (product_id, title.strip(), days, price_cents, stamp, stamp),
         )
-        self.invalidate_products_cache()
         return int(cur.lastrowid)
 
     def toggle_variant(self, variant_id: int) -> None:
@@ -1166,7 +1119,6 @@ class Store:
             "UPDATE product_variants SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END, updated_at = ? WHERE id = ?",
             (now_iso(), variant_id),
         )
-        self.invalidate_products_cache()
 
     def variant_order_count(self, variant_id: int) -> int:
         row = self.execute("SELECT COUNT(*) AS n FROM orders WHERE variant_id = ?", (variant_id,), one=True)
@@ -1175,10 +1127,8 @@ class Store:
     def delete_variant(self, variant_id: int) -> str:
         if self.variant_order_count(variant_id) > 0:
             self.execute("UPDATE product_variants SET active = 0, updated_at = ? WHERE id = ?", (now_iso(), variant_id))
-            self.invalidate_products_cache()
             return "hidden"
         self.execute("DELETE FROM product_variants WHERE id = ?", (variant_id,))
-        self.invalidate_products_cache()
         return "deleted"
 
     def add_stock(self, variant_id: int, lines: list[str]) -> int:
@@ -1378,7 +1328,6 @@ class Store:
                     )
                     order_id = int(cur.lastrowid)
                 self.commit()
-                self.invalidate_user_cache(user_id)
                 return {
                     "ok": True,
                     "order_id": order_id,
@@ -1451,7 +1400,6 @@ class Store:
                         self.q("UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?"),
                         (int(topup["amount_cents"]), stamp, int(topup["user_id"])),
                     )
-                    self.invalidate_user_cache(int(topup["user_id"]))
                 self.conn.execute(
                     self.q("UPDATE topups SET status = ?, admin_note = ?, updated_at = ? WHERE id = ?"),
                     (status, note, stamp, topup_id),
@@ -1526,7 +1474,6 @@ class Store:
                     self.q("UPDATE users SET balance_cents = balance_cents + ?, updated_at = ? WHERE user_id = ?"),
                     (amount, stamp, user_id),
                 )
-                self.invalidate_user_cache(user_id)
                 self.conn.execute(
                     self.q("UPDATE redeem_codes SET used_count = used_count + 1, updated_at = ? WHERE code = ?"),
                     (stamp, clean_code),
@@ -1546,11 +1493,8 @@ class Store:
                     "amount_cents": amount,
                     "new_balance_cents": int(user["balance_cents"]) if user else amount,
                 }
-            except Exception as exc:
+            except Exception:
                 self.rollback()
-                message = str(exc).lower()
-                if "redeem_claims" in message and ("unique" in message or "duplicate" in message):
-                    return {"ok": False, "reason": "already_claimed"}
                 raise
             finally:
                 self.log_slow_db("redeem claim transaction", started)
@@ -1612,6 +1556,7 @@ class TelegramAPI:
         self.base = f"https://api.telegram.org/bot{self.token}/" if self.token else ""
         self._local = threading.local()
         self.api_timeout = int(os.getenv("TG_API_TIMEOUT_SECONDS", "8"))
+        self.get_updates_timeout = int(os.getenv("TG_GET_UPDATES_TIMEOUT_SECONDS", "20"))
         self.send_timeout = int(os.getenv("TG_SEND_TIMEOUT_SECONDS", "8"))
         self.edit_timeout = int(os.getenv("TG_EDIT_TIMEOUT_SECONDS", "6"))
         self.copy_timeout = int(os.getenv("TG_COPY_TIMEOUT_SECONDS", "10"))
@@ -1656,6 +1601,18 @@ class TelegramAPI:
             except Exception as exc:
                 return {"ok": False, "description": str(exc)}
         return {"ok": False, "description": "request failed"}
+
+    def get_updates(self, offset: int, timeout: int | None = None) -> dict[str, Any]:
+        timeout = self.get_updates_timeout if timeout is None else timeout
+        return self.request(
+            "getUpdates",
+            {
+                "offset": offset,
+                "timeout": timeout,
+                "allowed_updates": ["message", "callback_query"],
+            },
+            timeout + 5,
+        )
 
     def set_webhook(
         self,
@@ -1811,6 +1768,7 @@ class BotApp:
         self.action_debounce_seconds = float(os.getenv("ACTION_DEBOUNCE_SECONDS", "0.7"))
         self.admin_action_debounce_seconds = float(os.getenv("ADMIN_ACTION_DEBOUNCE_SECONDS", "0.35"))
         self.slow_update_seconds = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "3"))
+        self.polling_error_sleep = float(os.getenv("POLLING_ERROR_SLEEP_SECONDS", "1"))
         self._recent_action_lock = threading.Lock()
         self._recent_actions: dict[tuple[int, str], float] = {}
         self._inflight_actions: set[tuple[int, str]] = set()
@@ -1826,20 +1784,6 @@ class BotApp:
         self.bulk_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self.bulk_queue_size)
         self.bulk_threads: list[threading.Thread] = []
         self._bulk_workers_started = False
-        self._reply_keyboard_markup = {
-            "keyboard": [
-                [{"text": "🛒 Buy Key"}, {"text": "👥 Invite Friends"}],
-                [{"text": "💳 Profile"}, {"text": "ℹ️ Info Bot"}],
-                [{"text": "🎁 Redeem"}],
-            ],
-            "resize_keyboard": True,
-            "is_persistent": True,
-        }
-        self._admin_reply_keyboard_markup = {
-            "keyboard": [[{"text": "👑 Admin Panel"}]],
-            "resize_keyboard": True,
-            "is_persistent": True,
-        }
 
     def is_admin(self, user_id: int) -> bool:
         return user_id in self.admins
@@ -1890,8 +1834,7 @@ class BotApp:
         parse_mode: str | None = None,
     ) -> None:
         if message_id:
-            edit_markup = None if reply_markup and "keyboard" in reply_markup else reply_markup
-            response = self.api.edit_message(chat_id, message_id, text, edit_markup, parse_mode=parse_mode)
+            response = self.api.edit_message(chat_id, message_id, text, reply_markup, parse_mode=parse_mode)
             if response.get("ok"):
                 return
         self.api.send_message(chat_id, text, reply_markup, parse_mode=parse_mode)
@@ -1977,7 +1920,31 @@ class BotApp:
                 self.bulk_queue.task_done()
 
     def run(self) -> None:
-        self.run_webhook()
+        self.run_polling()
+
+    def run_polling(self) -> None:
+        if not self.api.token:
+            raise RuntimeError("BOT_TOKEN is required")
+        if os.getenv("POLLING_DELETE_WEBHOOK", "1") == "1":
+            response = self.api.delete_webhook(drop_pending_updates=False)
+            if not response.get("ok"):
+                print("deleteWebhook warning:", response.get("description"), flush=True)
+        print(
+            f"Telegram selling bot polling started. workers={self.update_workers} bg_workers={self.background_workers}",
+            flush=True,
+        )
+        self.start_update_workers()
+        offset = 0
+        while not self.stop_event.is_set():
+            response = self.api.get_updates(offset)
+            if not response.get("ok"):
+                print("Polling error:", response.get("description"), flush=True)
+                time.sleep(self.polling_error_sleep)
+                continue
+            for update in response.get("result", []):
+                offset = max(offset, int(update["update_id"]) + 1)
+                while not self.enqueue_update(update):
+                    time.sleep(0.05)
 
     def webhook_path(self, webhook_url: str) -> str:
         configured = os.getenv("WEBHOOK_PATH", "").strip()
@@ -2110,7 +2077,6 @@ class BotApp:
                 if action_key:
                     action_started = True
                     self.mark_debounce_checked(update)
-                self.pre_answer_callback_update(update, user_id)
                 with self.user_lock(user_id):
                     self.handle_update(update)
         except Exception:
@@ -2153,22 +2119,6 @@ class BotApp:
         query = update.get("callback_query")
         if query and query.get("id"):
             self.api.answer_callback(query["id"], "Please wait...", alert=False)
-            query["_answered"] = True
-
-    def pre_answer_callback_update(self, update: dict[str, Any], user_id: int) -> None:
-        query = update.get("callback_query")
-        if not query or not query.get("id") or query.get("_answered"):
-            return
-        data = str(query.get("data") or "")
-        if data.startswith(("adm:", "ap:", "av:", "au:", "at:")) and not self.is_admin(user_id):
-            self.api.answer_callback(query["id"], "Admin only.", alert=True)
-        elif data == "u:stockout":
-            self.api.answer_callback(query["id"], "This option is stock out right now.", alert=True)
-        elif data == "verify":
-            self.api.answer_callback(query["id"], "Checking...")
-        else:
-            self.api.answer_callback(query["id"])
-        query["_answered"] = True
 
     def user_lock(self, user_id: int) -> threading.Lock:
         with self._user_locks_guard:
@@ -2337,20 +2287,13 @@ class BotApp:
             self.show_join_gate(chat_id)
             return
         state = self.store.get_state(user_id)
-        button = text.lower()
-        main_nav_labels = ("buy key", "invite friends", "profile", "info bot", "redeem")
-        if state and any(label in button for label in main_nav_labels):
-            self.store.clear_state(user_id)
-            state = None
-        if state and state[0] == "select_product" and not text.startswith("/"):
-            self.handle_select_product(chat_id, user_id, text, state[1])
-            return
         if state and state[0] == "custom_quantity" and not text.startswith("/"):
             self.handle_custom_quantity(chat_id, user_id, text, state[1])
             return
         if state and state[0] == "redeem_code" and not text.startswith("/"):
             self.handle_redeem_claim(chat_id, user_id, text)
             return
+        button = text.lower()
         if command in {"/start", "/menu"}:
             self.show_user_home(chat_id, user)
         elif command == "/shop" or "buy key" in button:
@@ -2499,10 +2442,24 @@ class BotApp:
             self.api.send_message(chat_id, self.store.setting("contact_text"), self.user_keyboard())
 
     def user_keyboard(self) -> dict[str, Any]:
-        return self.reply_keyboard()
+        return {
+            "inline_keyboard": [
+                [{"text": "🛒 Buy Key", "callback_data": "u:products"}, {"text": "👥 Invite Friends", "callback_data": "u:invite"}],
+                [{"text": "💳 Profile", "callback_data": "u:profile"}, {"text": "ℹ️ Info Bot", "callback_data": "u:info"}],
+                [{"text": "🎁 Redeem", "callback_data": "u:redeem"}],
+            ]
+        }
 
     def reply_keyboard(self) -> dict[str, Any]:
-        return self._reply_keyboard_markup
+        return {
+            "keyboard": [
+                [{"text": "🛒 Buy Key"}, {"text": "👥 Invite Friends"}],
+                [{"text": "💳 Profile"}, {"text": "ℹ️ Info Bot"}],
+                [{"text": "🎁 Redeem"}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
 
     def join_keyboard(self) -> dict[str, Any]:
         rows = []
@@ -2641,10 +2598,22 @@ class BotApp:
             f"👥 Friends invited: {referral_count}\n\n"
             "📍 Your unique link:\n"
             f"{html_code(link)}\n\n"
-            "📋 Tap and hold the link above to copy.\n\n"
+            "📋 Tap COPY LINK to receive the link alone, then tap and hold it to copy.\n\n"
             "📣 Start sharing now and get your keys for free."
         )
-        self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
+        share_url = "https://t.me/share/url?" + urllib.parse.urlencode(
+            {
+                "url": link,
+                "text": f"Join {self.store.setting('bot_name', 'our bot')} and start earning rewards.",
+            }
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📋 COPY LINK", "callback_data": "u:invite_copy"}],
+                [{"text": "📤 QUICK SHARE", "url": share_url}],
+            ]
+        }
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
     def send_referral_copy(self, chat_id: int, user_id: int) -> None:
         link = self.referral_link(user_id)
@@ -2669,11 +2638,27 @@ class BotApp:
             f"💰 Wallet: {html_bold(money(int(user['balance_cents']) if user else 0, self.currency()))}",
             f"👥 Invites: {html_bold(self.store.referral_count(user_id))}",
         ]
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id, parse_mode="HTML")
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📦 Order History", "callback_data": "u:orders"}],
+                [{"text": "⬅️ Back", "callback_data": "u:home"}],
+            ]
+        }
+        self.page(chat_id, "\n".join(lines), keyboard, message_id, parse_mode="HTML")
 
     def show_info_bot(self, chat_id: int, message_id: int | None = None) -> None:
         owner_url = self.store.setting("owner_url", "").strip()
         channel_url = self.store.setting("channel_url", "").strip()
+        rows = []
+        buttons = []
+        if channel_url:
+            buttons.append({"text": "💬 CHANNEL", "url": channel_url})
+        if owner_url:
+            buttons.append({"text": "👨‍💻 OWNER", "url": owner_url})
+        if buttons:
+            rows.append(buttons)
+        rows.append([{"text": "👥 Invite Friends", "callback_data": "u:invite"}])
+        rows.append([{"text": "⬅️ Back", "callback_data": "u:home"}])
         info_text = self.store.setting("info_text", "").strip()
         if not info_text or info_text.upper().startswith("HOW IT WORKS"):
             text = (
@@ -2686,22 +2671,15 @@ class BotApp:
             )
         else:
             text = f"ℹ️ <b>INFO BOT</b>\n\n{html_escape(info_text)}"
-        if channel_url:
-            text += f"\n\n💬 Channel: {html_code(channel_url)}"
-        if owner_url:
-            text += f"\n👨‍💻 Owner: {html_code(owner_url)}"
-        self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
+        self.page(chat_id, text, {"inline_keyboard": rows}, message_id, parse_mode="HTML")
 
     def show_products(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
         products = self.store.products(active_only=True)
         if not products:
             self.page(chat_id, "🛒 BUY KEY\n\nNo products are available right now.", self.user_keyboard(), message_id)
             return
-        self.store.set_state(user_id, "select_product", {"product_ids": [int(p["id"]) for p in products]})
-        lines = ["🛒 BUY KEY", "", "Select a product by sending its number:", ""]
-        for index, product in enumerate(products, start=1):
-            lines.append(f"{index}. {product_icon_plain(product['emoji'])} {product['title']}")
-        self.page(chat_id, "\n".join(lines), self.user_keyboard(), message_id)
+        rows = [[{"text": f"{product_icon_plain(p['emoji'])} {p['title']}", "callback_data": f"u:p:{p['id']}"}] for p in products]
+        self.page(chat_id, "🛒 BUY KEY\n\nSelect a product:", {"inline_keyboard": rows}, message_id)
 
     def show_product_variants(self, chat_id: int, user_id: int, product_id: int, message_id: int | None = None) -> None:
         product = self.store.product(product_id)
@@ -2762,18 +2740,6 @@ class BotApp:
 
     def duration_label(self, days: int) -> str:
         return f"{int(days)} Days"
-
-    def handle_select_product(self, chat_id: int, user_id: int, text: str, data: dict[str, Any]) -> None:
-        product_ids = [int(value) for value in data.get("product_ids", [])]
-        if not text.isdigit():
-            self.api.send_message(chat_id, "Send the product number from the list.\n/cancel to stop.", self.user_keyboard())
-            return
-        index = int(text)
-        if index < 1 or index > len(product_ids):
-            self.api.send_message(chat_id, "Invalid product number.\n/cancel to stop.", self.user_keyboard())
-            return
-        self.store.clear_state(user_id)
-        self.show_product_variants(chat_id, user_id, product_ids[index - 1])
 
     def show_quantity(self, chat_id: int, user_id: int, variant_id: int, message_id: int | None = None) -> None:
         variant = self.store.variant(variant_id)
@@ -2984,14 +2950,10 @@ class BotApp:
         self.api.send_message(chat_id, self.store.setting("payment_methods"), self.user_keyboard())
 
     def show_redeem(self, chat_id: int, user_id: int, message_id: int | None = None) -> None:
-        self.store.set_state(user_id, "redeem_code")
-        text = (
-            "\U0001f381 <b>REDEEM GIFT CODE</b>\n"
-            f"{LINE}\n\n"
-            "\U0001f4ac <i>Please paste your Gift Code below:</i>\n"
-            f"{LINE}"
-        )
-        self.page(chat_id, text, self.user_keyboard(), message_id, parse_mode="HTML")
+        self.store.clear_state(user_id)
+        text = "\U0001f381 <b>GIFT SYSTEM</b>\n\nChoose an option below:"
+        keyboard = {"inline_keyboard": [[{"text": "\u2705 REDEEM", "callback_data": "u:redeem_start"}]]}
+        self.page(chat_id, text, keyboard, message_id, parse_mode="HTML")
 
     def show_redeem_prompt(self, chat_id: int, user_id: int) -> None:
         self.store.set_state(user_id, "redeem_code")
@@ -3001,7 +2963,7 @@ class BotApp:
             "\U0001f4ac <i>Please paste your Gift Code below:</i>\n"
             f"{LINE}"
         )
-        self.api.send_message(chat_id, text, self.user_keyboard(), parse_mode="HTML")
+        self.api.send_message(chat_id, text, parse_mode="HTML")
 
     def handle_redeem_claim(self, chat_id: int, user_id: int, text: str) -> None:
         code = text.strip().upper()
@@ -3012,12 +2974,9 @@ class BotApp:
         self.store.clear_state(user_id)
         if not result.get("ok"):
             reason = result.get("reason")
-            if reason == "already_claimed":
-                self.api.send_message(chat_id, "You already used this redeem code.", self.user_keyboard())
-                return
             messages = {
                 "invalid": "Invalid or inactive Gift Code.",
-                "already_claimed": "You already used this redeem code.",
+                "already_claimed": "You already claimed this Gift Code.",
                 "used_up": "This Gift Code has reached its usage limit.",
             }
             self.api.send_message(
@@ -3121,7 +3080,11 @@ class BotApp:
         }
 
     def admin_reply_keyboard(self) -> dict[str, Any]:
-        return self._admin_reply_keyboard_markup
+        return {
+            "keyboard": [[{"text": "👑 Admin Panel"}]],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
 
     def admin_menu_guide(self) -> str:
         return (
@@ -3969,14 +3932,8 @@ class BotApp:
         }
 
     def notify_admins(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
-        self.start_background_task("notify_admins", self.notify_admins_task, text, reply_markup)
-
-    def notify_admins_task(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
         for admin_id in self.admins:
-            try:
-                self.api.send_message(admin_id, text, reply_markup)
-            except Exception as exc:
-                print(f"Admin notification failed for {admin_id}: {exc}", flush=True)
+            self.api.send_message(admin_id, text, reply_markup)
 
     def telegram_retry_after(self, result: dict[str, Any]) -> int:
         description = str(result.get("description") or "")
@@ -4173,13 +4130,15 @@ def main() -> int:
         )
         return 0
 
-    mode = os.getenv("BOT_MODE", "webhook").strip().lower()
-    if mode != "webhook":
-        raise RuntimeError("This optimized VPS build is webhook-only. Set BOT_MODE=webhook.")
-    app.run_webhook()
+    mode = os.getenv("BOT_MODE", "polling").strip().lower()
+    if mode == "webhook":
+        app.run_webhook()
+    elif mode == "polling":
+        app.run_polling()
+    else:
+        raise RuntimeError("BOT_MODE must be polling or webhook")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
